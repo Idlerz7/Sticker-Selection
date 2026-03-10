@@ -3,3 +3,10 @@ __pycache__
 dstc_data
 data/*
 !/data/ocr_max10.json
+
+# Data and model artifacts
+ckpt/
+checkpoints/
+datasets/
+outputs/
+runs/
