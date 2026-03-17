@@ -1,3 +1,7 @@
+import os
+# Work around protobuf C-extension segfault on some environments.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 from logging import log
 from posixpath import join
 import pytorch_lightning as pl
@@ -6,7 +10,7 @@ import torch
 from torch._C import device
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoTokenizer, BertForSequenceClassification, AdamW, HfArgumentParser, BertTokenizer
+from transformers import AutoTokenizer, BertForSequenceClassification, AdamW, HfArgumentParser, BertTokenizer, CLIPModel as HFCLIPModel, CLIPProcessor
 import transformers
 from typing import Optional
 from dataclasses import dataclass, field
@@ -15,10 +19,10 @@ from tqdm import tqdm
 from collections import Counter
 from transformers.utils.dummy_pt_objects import LogitsProcessor
 from utils import get_logger, top_filtering, try_create_dir, Timer
-import os
 import json
 from copy import deepcopy
 from PIL import Image
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import batch_to_device, cos_sim
 
@@ -35,6 +39,84 @@ class BertModel(BertForSequenceClassification):
         super().__init__(config)
 
 
+class HFClipSentenceEncoder(torch.nn.Module):
+    """Fallback encoder for local HuggingFace CLIP checkpoints."""
+
+    def __init__(self, model_path, local_files_only=True):
+        super().__init__()
+        resolved_model_path = model_path
+        if not os.path.exists(os.path.join(resolved_model_path, 'config.json')):
+            nested = os.path.join(resolved_model_path, '0_CLIPModel')
+            if os.path.exists(os.path.join(nested, 'config.json')):
+                resolved_model_path = nested
+        self.model = HFCLIPModel.from_pretrained(
+            resolved_model_path, local_files_only=local_files_only)
+        self.processor = CLIPProcessor.from_pretrained(
+            resolved_model_path, local_files_only=local_files_only)
+        self._target_device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self._target_device)
+        # Use torchvision preprocessing directly to avoid the slow
+        # "list of numpy.ndarrays -> tensor" path in transformers feature extractor.
+        self.preprocess = Compose([
+            Resize(224, interpolation=Image.BICUBIC),
+            CenterCrop(224),
+            lambda img: img.convert("RGB"),
+            ToTensor(),
+            Normalize((0.48145466, 0.4578275, 0.40821073),
+                      (0.26862954, 0.26130258, 0.27577711)),
+        ])
+
+    def tokenize(self, items):
+        image_features = []
+        text_inputs = []
+        image_text_info = []
+        for item in items:
+            if isinstance(item, str):
+                text_inputs.append(item)
+                image_text_info.append(1)
+            else:
+                if isinstance(item, torch.Tensor):
+                    image_features.append(item.unsqueeze(0))
+                else:
+                    image_features.append(self.preprocess(item).unsqueeze(0))
+                image_text_info.append(0)
+
+        features = {'image_text_info': image_text_info}
+        if image_features:
+            features['pixel_values'] = torch.cat(image_features, dim=0)
+        if text_inputs:
+            text_tokens = self.processor.tokenizer(
+                text_inputs, return_tensors='pt', padding=True, truncation=True)
+            features['input_ids'] = text_tokens['input_ids']
+            features['attention_mask'] = text_tokens['attention_mask']
+        return features
+
+    def forward(self, features):
+        sentence_embedding = []
+        img_embs = None
+        txt_embs = None
+        if 'pixel_values' in features:
+            with torch.no_grad():
+                img_embs = self.model.get_image_features(
+                    pixel_values=features['pixel_values'])
+        if 'input_ids' in features:
+            with torch.no_grad():
+                txt_embs = self.model.get_text_features(
+                    input_ids=features['input_ids'],
+                    attention_mask=features.get('attention_mask'))
+
+        img_i, txt_i = 0, 0
+        for input_type in features['image_text_info']:
+            if input_type == 0:
+                sentence_embedding.append(img_embs[img_i])
+                img_i += 1
+            else:
+                sentence_embedding.append(txt_embs[txt_i])
+                txt_i += 1
+        return {'sentence_embedding': torch.stack(sentence_embedding).float()}
+
+
 class Model(torch.nn.Module):
     def __init__(self, args):
         # config.num_labels = 307
@@ -44,9 +126,13 @@ class Model(torch.nn.Module):
         self.args = args
         logger.info(self.args.model_choice)
         self.temperature = torch.nn.Parameter(torch.tensor(args.init_temp))
-        self.bert = BertModel.from_pretrained(args.bert_pretrain_path)
+        if self.args.local_files_only and (not os.path.exists(args.bert_pretrain_path)):
+            raise FileNotFoundError(
+                f"Local bert model path not found: {args.bert_pretrain_path}")
+        self.bert = BertModel.from_pretrained(
+            args.bert_pretrain_path, local_files_only=args.local_files_only)
         self.bert_tokenizer = BertTokenizer.from_pretrained(
-            args.bert_pretrain_path)
+            args.bert_pretrain_path, local_files_only=args.local_files_only)
         special_tokens_dict = {
             'additional_special_tokens': ['[speaker1]', '[speaker2]']
         }
@@ -54,16 +140,29 @@ class Model(torch.nn.Module):
         self.bert.resize_token_embeddings(len(self.bert_tokenizer))
         if self.args.model_choice == 'use_clip_repo':
             logger.info('use clip repo')
-            self.clip_model, self.clip_process = clip.load("ViT-B/32")
+            self.clip_model, self.clip_process = clip.load(
+                "ViT-B/32", download_root=args.clip_download_root)
         elif self.args.model_choice == 'use_img_id':
             logger.info('use img id')
+            if self.args.local_files_only and (not os.path.exists(args.text_clip_pretrain_path)):
+                raise FileNotFoundError(
+                    f"Local sentence-transformer path not found: {args.text_clip_pretrain_path}")
             self.text_clip = SentenceTransformer(
-                'clip-ViT-B-32-multilingual-v1')
+                args.text_clip_pretrain_path)
             self.img_embedding_layer = torch.nn.Embedding(
                 args.max_image_id, 512)
         else:
             logger.info('use image clip')
-            self.img_clip = SentenceTransformer('clip-ViT-B-32')
+            if self.args.local_files_only and (not os.path.exists(args.img_pretrain_path)):
+                raise FileNotFoundError(
+                    f"Local sentence-transformer path not found: {args.img_pretrain_path}")
+            try:
+                self.img_clip = SentenceTransformer(args.img_pretrain_path)
+            except Exception as e:
+                logger.warning(
+                    f"SentenceTransformer load failed, fallback to HF CLIP: {e}")
+                self.img_clip = HFClipSentenceEncoder(
+                    args.img_pretrain_path, local_files_only=args.local_files_only)
             # self.text_clip = SentenceTransformer(
             #     'clip-ViT-B-32-multilingual-v1')
             if args.fix_text:
@@ -685,7 +784,10 @@ class Model(torch.nn.Module):
         if self.args.model_choice == 'use_clip_repo':
             self.img_process = self.clip_process
         else:
-            self.img_process = self.img_clip._first_module().preprocess
+            if hasattr(self.img_clip, 'preprocess'):
+                self.img_process = self.img_clip.preprocess
+            else:
+                self.img_process = self.img_clip._first_module().preprocess
         logger.info("prepare img objs")
         self.id2imgpath = {}
 
@@ -1230,8 +1332,6 @@ class PLModel(pl.LightningModule):
         from torch.optim.lr_scheduler import LambdaLR
         logger.info(
             f"img lr:{self.args.img_lr}, fix text:{self.args.fix_text}, fix img:{self.args.fix_img}")
-        for name, v in self.model.named_parameters():
-            print(name)
         assert self.args.model_choice == 'use_img_clip'
         img_params = [var for name, var in self.model.named_parameters(
         ) if name.startswith('img_clip') and var.requires_grad]
@@ -1378,7 +1478,13 @@ class Arguments:
     pretrain_path: Optional[str] = field(
         default='./ckpt/chinese-roberta-wwm-ext')
     bert_pretrain_path: Optional[str] = field(
-        default='bert-base-chinese')
+        default='./ckpt/bert-base-chinese')
+    img_pretrain_path: Optional[str] = field(
+        default='./ckpt/clip-ViT-B-32')
+    text_clip_pretrain_path: Optional[str] = field(
+        default='./ckpt/clip-ViT-B-32-multilingual-v1')
+    clip_download_root: Optional[str] = field(default='./ckpt')
+    local_files_only: Optional[bool] = field(default=True)
     pl_root_dir: Optional[str] = field(default='logs/clip')
     id2img_path: Optional[str] = field(default='./data/id2img.json')
     img_dir: Optional[str] = field(default='./data/meme_set')
@@ -1424,6 +1530,10 @@ class Arguments:
 
 
 def main(args):
+    if args.local_files_only:
+        # Keep HF/Transformers strictly offline.
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
     pl.seed_everything(args.seed)
     if args.mode == 'train' or args.mode == 'pretrain':
         model = PLModel(args)

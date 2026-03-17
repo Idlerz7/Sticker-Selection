@@ -6,6 +6,19 @@ from copy import deepcopy
 from random import seed, randint, choice
 
 
+def safe_int(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if value == '':
+            return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_id2name(path='./data/id2img.json'):
     id2name = {}
     with open(path, encoding='utf-8') as f:
@@ -108,6 +121,7 @@ def create_test_data(in_file_name, out_file_name, candidate=False):
     max_id = 0
     id2name = get_id2name()
     cnt = 0
+    skipped_invalid_answer = 0
     with open(in_file_name, encoding='utf-8') as in_f:
         a = json.load(in_f)
         for v in tqdm(a):
@@ -121,8 +135,7 @@ def create_test_data(in_file_name, out_file_name, candidate=False):
                 img_id = r.get('img_id', None)
                 emotion_id = r.get('emotion_id', None)
                 # dialog.append(speaker + text)
-                if img_id:
-                    img_id = int(img_id)
+                img_id = safe_int(img_id)
                 if img_id:
                     d = {
                         'text': text,
@@ -140,7 +153,10 @@ def create_test_data(in_file_name, out_file_name, candidate=False):
                     dialog.append(d)
             ans = v['answer']
             assert ans['speaker_id'] == v['history'][-1]['speaker_id']
-            img_id = int(ans['img_id'])
+            img_id = safe_int(ans.get('img_id'))
+            if img_id is None:
+                skipped_invalid_answer += 1
+                continue
             max_id = max(max_id, img_id)
             img_name = id2name.get(img_id, None)
             dialog[-1]['img_id'] = img_id
@@ -148,14 +164,16 @@ def create_test_data(in_file_name, out_file_name, candidate=False):
             outd = deepcopy(dialog)
             if candidate:
                 cand = v['candidate']['set']
-                cand = [int(t) for t in cand]
+                cand = [safe_int(t) for t in cand]
+                cand = [t for t in cand if t is not None]
                 res.append({'dialog': outd, 'cand': cand, 'idx': cnt})
                 cnt += 1
             else:
                 res.append({'dialog': outd, 'idx': cnt})
                 cnt += 1
 
-    print(f"{out_file_name}, max img id:{max_id}")
+    print(
+        f"{out_file_name}, max img id:{max_id}, skipped invalid answers:{skipped_invalid_answer}")
 
     with open(out_file_name, 'w', encoding='utf-8') as f:
         json.dump(res, f, indent=2, ensure_ascii=False)
