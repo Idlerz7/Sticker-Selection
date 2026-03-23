@@ -1,12 +1,47 @@
-log*
-__pycache__
-dstc_data
-data/*
-!/data/ocr_max10.json
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
 
-# Data and model artifacts
+# IDE / local editor
+.vscode/
+.idea/
+
+# Runtime logs and debug outputs
+log*
+*.log
+logger_*.txt
+
+# Large datasets and local data artifacts
+dstc_data/
+data/*
+!data/ocr_max10.json
+u-sticker/
+
+# Training / evaluation outputs
+logs/
+result/
+pseudo_labels/
+style_neighbors.json
+
+# Model checkpoints and downloaded model files
 ckpt/
 checkpoints/
+models/
 datasets/
 outputs/
 runs/
+*.ckpt
+
+# Misc local artifacts
+*.tmp
+*.swp
+
+# Large archives and split volumes
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.z[0-9][0-9]

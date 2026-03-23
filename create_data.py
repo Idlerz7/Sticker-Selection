@@ -97,6 +97,7 @@ def create_data(in_file_name, out_file_name, pair=False):
                 if i > 0 and img_id:
                     max_id = max(max_id, img_id)
                     outd = deepcopy(dialog)
+                    user_id = f"{k}::{speaker}"
                     if pair:
                         pos_id = outd[-1]['img_id']
                         neg_id = pos_id
@@ -108,7 +109,7 @@ def create_data(in_file_name, out_file_name, pair=False):
                     tot += 1
                     if img_id is not None and emotion_id is None:
                         continue
-                    res.append({'dialog': outd})
+                    res.append({'dialog': outd, 'user_id': user_id, 'dialogue_id': k})
     print(f"{out_file_name}, len:{len(res)}, original total_len:{tot}, max img id:{max_id}")
 
     with open(out_file_name, 'w', encoding='utf-8') as f:
@@ -162,14 +163,15 @@ def create_test_data(in_file_name, out_file_name, candidate=False):
             dialog[-1]['img_id'] = img_id
             dialog[-1]['img_label'] = img_name
             outd = deepcopy(dialog)
+            user_id = f"test::{cnt}::{ans['speaker_id']}"
             if candidate:
                 cand = v['candidate']['set']
                 cand = [safe_int(t) for t in cand]
                 cand = [t for t in cand if t is not None]
-                res.append({'dialog': outd, 'cand': cand, 'idx': cnt})
+                res.append({'dialog': outd, 'cand': cand, 'idx': cnt, 'user_id': user_id})
                 cnt += 1
             else:
-                res.append({'dialog': outd, 'idx': cnt})
+                res.append({'dialog': outd, 'idx': cnt, 'user_id': user_id})
                 cnt += 1
 
     print(

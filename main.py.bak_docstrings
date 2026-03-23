@@ -1,0 +1,2039 @@
+import os
+# Work around protobuf C-extension segfault on some environments.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+import time
+
+from logging import log
+import logging
+from posixpath import join
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+import torch
+from torch._C import device
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+from transformers import AutoTokenizer, BertForSequenceClassification, AdamW, HfArgumentParser, BertTokenizer, CLIPModel as HFCLIPModel, CLIPProcessor
+import transformers
+from typing import Optional
+from dataclasses import dataclass, field
+import numpy as np
+from tqdm import tqdm
+from collections import Counter, defaultdict
+import hashlib
+from transformers.utils.dummy_pt_objects import LogitsProcessor
+from utils import get_logger, top_filtering, try_create_dir, Timer
+import json
+from copy import deepcopy
+from PIL import Image
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import batch_to_device, cos_sim
+
+from metrics import MyAccuracy
+import clip
+
+logger = get_logger(__name__)
+_run_file_handler = None
+
+
+def attach_run_log_file(log_file, args=None):
+    """Attach one per-run file logger (under current lightning version dir)."""
+    global _run_file_handler
+    log_dir = os.path.dirname(log_file)
+    if log_dir:
+        try_create_dir(log_dir)
+    if _run_file_handler is not None:
+        logger.removeHandler(_run_file_handler)
+        try:
+            _run_file_handler.close()
+        except Exception:
+            pass
+    file_handler = logging.FileHandler(log_file, mode='w')
+    if len(logger.handlers) > 0 and logger.handlers[0].formatter is not None:
+        file_handler.setFormatter(logger.handlers[0].formatter)
+    _run_file_handler = file_handler
+    logger.addHandler(file_handler)
+    logger.info(f"run log file: {log_file}")
+    if args is not None:
+        logger.info("run args attached to this version log")
+
+
+def attach_version_log_from_trainer(args, trainer):
+    log_dir = trainer.log_dir
+    if not log_dir:
+        log_dir = os.path.join(args.pl_root_dir, 'lightning_logs')
+    log_file = os.path.join(log_dir, f'{args.mode}.log')
+    attach_run_log_file(log_file, args=args)
+
+
+def attach_manual_log_file(args):
+    ts = time.strftime('%Y%m%d-%H%M%S')
+    log_file = os.path.join(args.pl_root_dir, 'manual_logs', f'{args.mode}-{ts}.log')
+    attach_run_log_file(log_file, args=args)
+
+
+class BertModel(BertForSequenceClassification):
+    def __init__(self, config):
+        config.num_labels = 2
+        super().__init__(config)
+
+
+def _extract_speaker_from_text(text):
+    if not text:
+        return 'unknown_speaker'
+    if text.startswith('[speaker1]'):
+        return '[speaker1]'
+    if text.startswith('[speaker2]'):
+        return '[speaker2]'
+    return 'unknown_speaker'
+
+
+def _resolve_user_key(sample, dialog, fallback_index):
+    user_id = sample.get('user_id', None)
+    if user_id is not None:
+        return str(user_id)
+    dialogue_id = sample.get('dialogue_id', None)
+    if dialogue_id is not None and len(dialog) > 0:
+        speaker = _extract_speaker_from_text(dialog[-1].get('text', ''))
+        return f"{dialogue_id}::{speaker}"
+    # Backward-compatible fallback for old *_pair.json without real user_id.
+    # Current visual-only version may use this pseudo user key in training.
+    # This pseudo id is deterministic, but not guaranteed to align across all
+    # samples from the same real user.
+    first_text = ''
+    if len(dialog) > 0:
+        first_text = dialog[0].get('text', '')
+    speaker = _extract_speaker_from_text(dialog[-1].get('text', '')) if len(
+        dialog) > 0 else 'unknown_speaker'
+    digest = hashlib.md5(first_text.encode('utf-8')).hexdigest()[:12]
+    return f"pseudo::{digest}::{speaker}"
+
+
+class VisualHistoryAttention(torch.nn.Module):
+    """Learnable attention pooling over visual history."""
+
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.w_v1 = torch.nn.Linear(input_dim, hidden_dim)
+        self.w_v2 = torch.nn.Linear(hidden_dim, 1)
+
+    def forward(self, history_feats, history_mask=None):
+        # history_feats: [B, K, D]
+        if history_feats.size(1) == 0:
+            return torch.zeros(history_feats.size(0), history_feats.size(2), device=history_feats.device, dtype=history_feats.dtype)
+        scores = self.w_v2(torch.tanh(self.w_v1(history_feats))).squeeze(-1)
+        if history_mask is not None:
+            scores = scores.masked_fill(~history_mask, -1e4)
+        attn = torch.softmax(scores, dim=-1)
+        if history_mask is not None:
+            attn = attn * history_mask.float()
+            denom = attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            attn = attn / denom
+        pooled = torch.bmm(attn.unsqueeze(1), history_feats).squeeze(1)
+        if history_mask is not None:
+            has_history = history_mask.any(dim=-1, keepdim=True).float()
+            pooled = pooled * has_history
+        return pooled
+
+
+class UserVisualFusion(torch.nn.Module):
+    """Fuse user-id embedding and visual preference by gating."""
+
+    def __init__(self, num_users, feature_dim):
+        super().__init__()
+        self.user_embedding = torch.nn.Embedding(num_users, feature_dim)
+        self.gate = torch.nn.Linear(feature_dim * 2, feature_dim)
+
+    def forward(self, visual_pref, user_indices):
+        user_pref = self.user_embedding(user_indices)
+        gate = torch.sigmoid(self.gate(torch.cat([user_pref, visual_pref], dim=-1)))
+        return gate * user_pref + (1.0 - gate) * visual_pref
+
+
+class HFClipSentenceEncoder(torch.nn.Module):
+    """Fallback encoder for local HuggingFace CLIP checkpoints."""
+
+    def __init__(self, model_path, local_files_only=True):
+        super().__init__()
+        resolved_model_path = model_path
+        if not os.path.exists(os.path.join(resolved_model_path, 'config.json')):
+            nested = os.path.join(resolved_model_path, '0_CLIPModel')
+            if os.path.exists(os.path.join(nested, 'config.json')):
+                resolved_model_path = nested
+        self.model = HFCLIPModel.from_pretrained(
+            resolved_model_path, local_files_only=local_files_only)
+        self.processor = CLIPProcessor.from_pretrained(
+            resolved_model_path, local_files_only=local_files_only)
+        self._target_device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self._target_device)
+        # Use torchvision preprocessing directly to avoid the slow
+        # "list of numpy.ndarrays -> tensor" path in transformers feature extractor.
+        self.preprocess = Compose([
+            Resize(224, interpolation=Image.BICUBIC),
+            CenterCrop(224),
+            lambda img: img.convert("RGB"),
+            ToTensor(),
+            Normalize((0.48145466, 0.4578275, 0.40821073),
+                      (0.26862954, 0.26130258, 0.27577711)),
+        ])
+
+    def tokenize(self, items):
+        image_features = []
+        text_inputs = []
+        image_text_info = []
+        for item in items:
+            if isinstance(item, str):
+                text_inputs.append(item)
+                image_text_info.append(1)
+            else:
+                if isinstance(item, torch.Tensor):
+                    image_features.append(item.unsqueeze(0))
+                else:
+                    image_features.append(self.preprocess(item).unsqueeze(0))
+                image_text_info.append(0)
+
+        features = {'image_text_info': image_text_info}
+        if image_features:
+            features['pixel_values'] = torch.cat(image_features, dim=0)
+        if text_inputs:
+            text_tokens = self.processor.tokenizer(
+                text_inputs, return_tensors='pt', padding=True, truncation=True)
+            features['input_ids'] = text_tokens['input_ids']
+            features['attention_mask'] = text_tokens['attention_mask']
+        return features
+
+    def forward(self, features):
+        sentence_embedding = []
+        img_embs = None
+        txt_embs = None
+        if 'pixel_values' in features:
+            with torch.no_grad():
+                img_embs = self.model.get_image_features(
+                    pixel_values=features['pixel_values'])
+        if 'input_ids' in features:
+            with torch.no_grad():
+                txt_embs = self.model.get_text_features(
+                    input_ids=features['input_ids'],
+                    attention_mask=features.get('attention_mask'))
+
+        img_i, txt_i = 0, 0
+        for input_type in features['image_text_info']:
+            if input_type == 0:
+                sentence_embedding.append(img_embs[img_i])
+                img_i += 1
+            else:
+                sentence_embedding.append(txt_embs[txt_i])
+                txt_i += 1
+        return {'sentence_embedding': torch.stack(sentence_embedding).float()}
+
+
+class Model(torch.nn.Module):
+    def __init__(self, args):
+        # config.num_labels = 307
+        # super().__init__(config)
+        super().__init__()
+        # self.segment_embedding = torch.nn.Embedding(2, config.hidden_size) # 0: speaker1 1: speaker2
+        self.args = args
+        logger.info(self.args.model_choice)
+        self.temperature = torch.nn.Parameter(torch.tensor(args.init_temp))
+        if self.args.local_files_only and (not os.path.exists(args.bert_pretrain_path)):
+            raise FileNotFoundError(
+                f"Local bert model path not found: {args.bert_pretrain_path}")
+        self.bert = BertModel.from_pretrained(
+            args.bert_pretrain_path, local_files_only=args.local_files_only)
+        self.bert_tokenizer = BertTokenizer.from_pretrained(
+            args.bert_pretrain_path, local_files_only=args.local_files_only)
+        self.visual_feat_dim = 512
+        self.bert_hidden_dim = self.bert.config.hidden_size
+        special_tokens_dict = {
+            'additional_special_tokens': ['[speaker1]', '[speaker2]']
+        }
+        self.bert_tokenizer.add_special_tokens(special_tokens_dict)
+        self.bert.resize_token_embeddings(len(self.bert_tokenizer))
+        if self.args.model_choice == 'use_clip_repo':
+            logger.info('use clip repo')
+            self.clip_model, self.clip_process = clip.load(
+                "ViT-B/32", download_root=args.clip_download_root)
+        elif self.args.model_choice == 'use_img_id':
+            logger.info('use img id')
+            if self.args.local_files_only and (not os.path.exists(args.text_clip_pretrain_path)):
+                raise FileNotFoundError(
+                    f"Local sentence-transformer path not found: {args.text_clip_pretrain_path}")
+            self.text_clip = SentenceTransformer(
+                args.text_clip_pretrain_path)
+            self.img_embedding_layer = torch.nn.Embedding(
+                args.max_image_id, self.visual_feat_dim)
+        else:
+            logger.info('use image clip')
+            if self.args.local_files_only and (not os.path.exists(args.img_pretrain_path)):
+                raise FileNotFoundError(
+                    f"Local sentence-transformer path not found: {args.img_pretrain_path}")
+            try:
+                self.img_clip = SentenceTransformer(args.img_pretrain_path)
+            except Exception as e:
+                logger.warning(
+                    f"SentenceTransformer load failed, fallback to HF CLIP: {e}")
+                self.img_clip = HFClipSentenceEncoder(
+                    args.img_pretrain_path, local_files_only=args.local_files_only)
+            # self.text_clip = SentenceTransformer(
+            #     'clip-ViT-B-32-multilingual-v1')
+            if args.fix_text:
+                self.bert.eval()
+                for p in self.bert.parameters():
+                    p.requires_grad = False
+            if args.fix_img:
+                self.img_clip.eval()
+                for p in self.img_clip.parameters():
+                    p.requires_grad = False
+
+        # self.text_clip = SentenceTransformer('clip-ViT-B-32')
+        self.text_ff = torch.nn.Linear(self.bert_hidden_dim, self.bert_hidden_dim)
+        self.img_ff = torch.nn.Linear(self.visual_feat_dim, self.bert_hidden_dim)
+        if args.add_emotion_task:
+            self.emotion_head = torch.nn.Linear(self.bert_hidden_dim, args.max_emotion_id)
+        if args.add_predict_context_task or args.add_predict_img_label_task:
+            self.mlm_head = torch.nn.Linear(self.bert_hidden_dim, len(self.bert_tokenizer))
+        # self.text_clip_ff = torch.nn.Linear(512, 512)
+        with open(self.args.ocr_path, encoding='utf-8') as f:
+            a = json.load(f)
+
+        self.id2ocr = {}
+        for k, v in a.items():
+            self.id2ocr[int(k)] = v['ocr']
+
+        self.id2name = {}
+        with open('./data/id2name.json', encoding='utf-8') as f:
+            a = json.load(f)
+            for k, v in a.items():
+                self.id2name[int(k)] = v
+
+        self.predict_id2ocr = {}
+        self.user_to_index = {'__UNK__': 0}
+        self.user_history_imgids = {}
+        self.history_img_emb_cache = None
+        if self.args.use_visual_personalization_token:
+            self._init_visual_personalization()
+
+    def _build_user_visual_history_cache(self):
+        path = self.args.train_data_path
+        if not path or (not os.path.exists(path)):
+            logger.warning(
+                f"visual personalization disabled cache build, missing train data path: {path}")
+            return
+
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+
+        user_hist = defaultdict(list)
+        for idx, sample in enumerate(data):
+            dialog = sample.get('dialog', [])
+            if len(dialog) == 0:
+                continue
+            target = dialog[-1]
+            img_id = target.get('img_id', None)
+            if img_id is None:
+                continue
+            user_key = _resolve_user_key(sample, dialog, idx)
+            # 这里先构建“完整静态历史”（不过滤当前样本），
+            # 真正的样本级 leave-one-out 会在 forward 阶段按 batch 动态执行。
+            # 这样可避免在离线建库时引入复杂时序逻辑，也便于训练/测试复用同一份缓存。
+            user_hist[user_key].append(int(img_id))
+
+        max_len = self.args.visual_history_max_len
+        # 按 user_key 排序，保证 user_to_index 映射稳定可复现。
+        # 这样不同运行中只要数据一致，user embedding 的行号就不会漂移。
+        for user_key in sorted(user_hist.keys()):
+            ids = user_hist[user_key]
+            self.user_to_index[user_key] = len(self.user_to_index)
+            self.user_history_imgids[self.user_to_index[user_key]] = ids[-max_len:]
+        logger.info(
+            f"visual history cache built, users:{len(self.user_to_index)-1}, max_len:{max_len}")
+
+    def _save_user_history_cache(self):
+        path = self.args.user_history_cache_path
+        if not path:
+            return
+        out_dir = os.path.dirname(path)
+        if out_dir:
+            try_create_dir(out_dir)
+        payload = {
+            "user_to_index": self.user_to_index,
+            "user_history_imgids": {str(k): v for k, v in self.user_history_imgids.items()},
+            "visual_history_max_len": self.args.visual_history_max_len,
+        }
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logger.info(f"saved user history cache: {path}")
+
+    def _load_user_history_cache(self):
+        path = self.args.user_history_cache_path
+        if not path or (not os.path.exists(path)):
+            return False
+        with open(path, encoding='utf-8') as f:
+            payload = json.load(f)
+        user_to_index = payload.get("user_to_index", None)
+        history = payload.get("user_history_imgids", None)
+        if not isinstance(user_to_index, dict) or not isinstance(history, dict):
+            logger.warning(f"invalid user history cache format: {path}")
+            return False
+        self.user_to_index = {str(k): int(v) for k, v in user_to_index.items()}
+        if '__UNK__' not in self.user_to_index:
+            self.user_to_index['__UNK__'] = 0
+        self.user_history_imgids = {}
+        for k, ids in history.items():
+            self.user_history_imgids[int(k)] = [int(x) for x in ids]
+        logger.info(
+            f"loaded user history cache: {path}, users:{len(self.user_to_index)-1}")
+        return True
+
+    def _init_visual_personalization(self):
+        # 当前版本仅实现 visual-only 个性化：
+        #   1) 用户历史视觉偏好向量
+        #   2) user_id embedding 门控融合
+        #   3) 作为 [USER] token 早融合进 BERT
+        # semantic / emotion 个性化故意不在本版本实现。
+        loaded = self._load_user_history_cache()
+        if not loaded:
+            self._build_user_visual_history_cache()
+            if self.args.mode in ['train', 'pretrain']:
+                self._save_user_history_cache()
+            else:
+                raise FileNotFoundError(
+                    f"user_history_cache_path not found for mode={self.args.mode}: {self.args.user_history_cache_path}. "
+                    "Use the same cache generated during training to keep user_to_index aligned.")
+        hidden_dim = self.args.visual_personalization_hidden_dim
+        self.visual_history_attention = VisualHistoryAttention(
+            input_dim=self.visual_feat_dim, hidden_dim=hidden_dim)
+        if not self.args.use_visual_history_attention:
+            logger.info("use_visual_history_attention=False, fallback to masked mean pooling.")
+        self.user_visual_fusion = UserVisualFusion(
+            num_users=len(self.user_to_index), feature_dim=self.visual_feat_dim)
+        # 两个投影层都映射到 BERT hidden size：
+        # user_token_proj: 用户偏好向量 -> [USER] token
+        # sticker_token_proj: 贴纸视觉向量 -> [STICKER] token
+        self.user_token_proj = torch.nn.Linear(self.visual_feat_dim, self.bert_hidden_dim)
+        self.sticker_token_proj = torch.nn.Linear(self.visual_feat_dim, self.bert_hidden_dim)
+
+    def _get_user_indices(self, user_ids, device):
+        idx = [self.user_to_index.get(str(u), 0) for u in user_ids]
+        return torch.tensor(idx, dtype=torch.long, device=device)
+
+    def _get_history_img_emb_cache(self, device):
+        if self.history_img_emb_cache is None:
+            with torch.no_grad():
+                all_ids = list(range(self.args.max_image_id))
+                if self.args.model_choice == 'use_img_id':
+                    img_ids_ts = torch.tensor(all_ids, dtype=torch.long, device=device)
+                    embs = self.img_embedding_layer(img_ids_ts)
+                elif self.args.model_choice == 'use_clip_repo':
+                    img_objs = [self.get_image_obj(i) for i in all_ids]
+                    clip_device = next(self.clip_model.parameters()).device
+                    img = torch.stack(img_objs, dim=0).to(clip_device)
+                    self.clip_model.eval()
+                    embs = self.clip_model.encode_image(img).to(device)
+                else:
+                    embs = self.get_emb_by_imgids(all_ids)
+                self.history_img_emb_cache = embs.detach()
+        return self.history_img_emb_cache.to(device)
+
+    def _get_user_visual_preference(self, user_indices, current_img_ids, device):
+        batch_size = user_indices.size(0)
+        if (len(self.user_history_imgids) == 0) or (self.args.visual_history_max_len <= 0):
+            return torch.zeros(batch_size, self.visual_feat_dim, device=device)
+        max_len = self.args.visual_history_max_len
+        history_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+        history_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
+        current_img_ids = current_img_ids if current_img_ids is not None else [None] * batch_size
+        for row, uid in enumerate(user_indices.tolist()):
+            ids = self.user_history_imgids.get(uid, [])
+            if len(ids) == 0:
+                continue
+            current_img_id = current_img_ids[row]
+            # Leave-one-out（样本级）：
+            # 只对“当前样本”移除自己的正例 img_id，且这里采用“移除全部同 id 项”的策略。
+            # 这样实现简单且最安全，避免同图重复历史造成信息泄漏。
+            if current_img_id is not None:
+                ids = [hid for hid in ids if hid != int(current_img_id)]
+            ids = ids[-max_len:]
+            if len(ids) == 0:
+                continue
+            n = len(ids)
+            history_ids[row, :n] = torch.tensor(ids, dtype=torch.long, device=device)
+            history_mask[row, :n] = True
+        all_embs = self._get_history_img_emb_cache(device)
+        history_feats = all_embs[history_ids]
+        if self.args.use_visual_history_attention:
+            visual_pref = self.visual_history_attention(
+                history_feats=history_feats, history_mask=history_mask)
+        else:
+            denom = history_mask.float().sum(dim=-1, keepdim=True).clamp_min(1.0)
+            visual_pref = (history_feats * history_mask.unsqueeze(-1).float()).sum(dim=1) / denom
+            visual_pref = visual_pref * history_mask.any(dim=-1, keepdim=True).float()
+        return visual_pref
+
+    def _build_user_token(self, user_ids, current_img_ids, device):
+        user_indices = self._get_user_indices(user_ids, device)
+        visual_pref = self._get_user_visual_preference(user_indices, current_img_ids, device)
+        fused_user = self.user_visual_fusion(visual_pref=visual_pref, user_indices=user_indices)
+        return self.user_token_proj(fused_user).unsqueeze(1)
+
+    def _get_loo_current_img_ids(self, img_ids, test):
+        # 训练阶段默认启用 LOO，避免把当前样本正例泄漏进用户历史。
+        # 测试阶段默认关闭（更贴近真实推理），可用 --loo_filter_in_test=true 强制开启。
+        if test and (not self.args.loo_filter_in_test):
+            return None
+        return img_ids
+
+    def _compose_personalized_inputs(self, text_emb, attention_mask, sticker_token, user_token, aux_emb=None):
+        # 个性化输入拼接模板（早融合）：
+        # [CLS] [USER] 文本... [SEP] [AUX可选] [STICKER] [SEP]
+        # 注意三件事必须同步：
+        # 1) input_emb 的拼接顺序
+        # 2) attention_mask 的长度和位置
+        # 3) token_type_ids 的分段标记
+        cls_emb = text_emb[:, :1, :]
+        text_rest = text_emb[:, 1:, :]
+        sep_emb = self.bert.bert.embeddings.word_embeddings(
+            torch.tensor(self.bert_tokenizer.sep_token_id, device=text_emb.device, dtype=torch.long)
+        ).unsqueeze(0).unsqueeze(0).repeat(text_emb.size(0), 1, 1)
+        input_parts = [cls_emb, user_token, text_rest]
+        mask_parts = [attention_mask[:, :1], torch.ones(text_emb.size(0), 1, device=attention_mask.device), attention_mask[:, 1:]]
+        if aux_emb is not None:
+            input_parts.append(aux_emb)
+            mask_parts.append(torch.ones(text_emb.size(0), aux_emb.size(1), device=attention_mask.device))
+        input_parts.append(sticker_token)
+        mask_parts.append(torch.ones(text_emb.size(0), 1, device=attention_mask.device))
+        input_parts.append(sep_emb)
+        mask_parts.append(torch.ones(text_emb.size(0), 1, device=attention_mask.device))
+        input_emb = torch.cat(input_parts, dim=1)
+        full_attention_mask = torch.cat(mask_parts, dim=1)
+        token_type_ids = torch.zeros_like(full_attention_mask, dtype=torch.long)
+        token_type_ids[:, -2:] = 1
+        if aux_emb is not None:
+            token_type_ids[:, -(aux_emb.size(1) + 2):] = 1
+        return input_emb, full_attention_mask, token_type_ids
+
+    def get_image_obj(self, id):
+        if id in self.id2img:
+            return self.id2img[id]
+
+        img_file_name = self.id2imgpath[id]
+        img_dir = self.args.img_dir
+        path = os.path.join(img_dir, img_file_name)
+        from img_utils import pick_single_frame
+        with open(path, 'rb') as fin:
+            data = fin.read()
+        img_obj = self.img_process(pick_single_frame(data))
+        if self.args.mode != 'pretrain':
+            self.id2img[id] = img_obj
+        return img_obj
+
+    def prepare_for_test(self):
+        logger.info("prepare_for_test!")
+        with torch.no_grad():
+            if self.args.model_choice == 'use_clip_repo':
+                img_objs = []
+                for id in range(self.args.max_image_id):
+                    img_obj = self.id2img[id]
+                    img_objs.append(img_obj)
+                device = next(self.clip_model.parameters()).device
+                img = torch.stack(img_objs, dim=0).to(device)
+                self.clip_model.eval()
+                self.all_img_embs = self.clip_model.encode_image(img)
+
+            elif self.args.model_choice == 'use_img_id':
+                img_ids = list(range(self.args.max_image_id))
+                self.all_img_embs = self.img_embedding_layer(torch.tensor(
+                    img_ids, dtype=torch.long, device=self.text_clip.device))
+
+            else:
+                img_objs = []
+                for id in range(self.args.max_image_id):
+                    img_obj = self.get_image_obj(id)
+                    img_objs.append(img_obj)
+                img_tokens = self.img_clip.tokenize(img_objs)
+
+                img_tokens = batch_to_device(
+                    img_tokens, self.img_clip._target_device)
+                self.img_clip.eval()
+                self.all_img_embs = self.img_clip.forward(
+                    img_tokens)['sentence_embedding']
+
+    def get_emb_by_imgids(self, img_ids):
+        img_objs = []
+        for i, id in enumerate(img_ids):
+            img_obj = self.get_image_obj(id)
+            img_objs.append(img_obj)
+        img_tokens = self.img_clip.tokenize(img_objs)
+
+        img_tokens = batch_to_device(
+            img_tokens, self.img_clip._target_device)
+
+        img_emb = self.img_clip.forward(
+            img_tokens)['sentence_embedding']
+        return img_emb
+
+    def get_input_output_imglabel_by_imgid(self, img_id):
+        max_len = self.args.max_img_label_mask_num
+        self.tokenizer = self.bert_tokenizer
+        mask_id = self.tokenizer.mask_token_id
+        cls_id = self.tokenizer.cls_token_id
+        mask_predict_inputs = [mask_id] * max_len
+        ocr = self.id2ocr[img_id]
+        if ocr != '':
+            ids = self.tokenizer.encode(ocr, add_special_tokens=False)
+            # mask_predict_outputs = [mask_id] * \
+            #     (max_len - len(ids) - 1) + [cls_id] + ids
+            mask_predict_outputs = [-100] * \
+                (max_len - len(ids) - 1) + [cls_id] + ids
+            cls_inputs = [mask_id] * (max_len - len(ids)) + ids
+        else:
+            mask_predict_outputs = [-100] * max_len
+            cls_inputs = [mask_id] * max_len
+        return mask_predict_inputs, mask_predict_outputs, cls_inputs
+
+    def check_has_ocr(self, img_id):
+        ocr = self.id2ocr[img_id]
+        if ocr == '':
+            return False
+        return True
+
+    def update_predict_ocr(self, img_id, img_label, logits=None):
+        if img_id not in self.predict_id2ocr:
+            self.predict_id2ocr[img_id] = Counter()
+
+        self.predict_id2ocr[img_id][img_label] += 1
+        logger.debug(
+            f"img_id: {img_id}, true img label: {self.id2name[img_id]}, pred img_label: {img_label}")
+        if logits is not None:
+            logits = logits.squeeze(0)
+            _, indices = torch.topk(logits, k=5, dim=-1)
+            for idx in indices:
+                logger.debug(
+                    f"tokens:{self.tokenizer.convert_ids_to_tokens(idx)}")
+
+    def predict_img_label(self, input_ids, attention_mask, batch_idx=1, img_ids=None):
+        device = input_ids.device
+        img_emb = self.get_emb_by_imgids(img_ids)
+        mask_predict_inputs_ts = []
+        assert len(img_ids) == 1
+        if self.check_has_ocr(img_ids[0]):
+            return
+        for img_id in img_ids:
+            mask_predict_inputs, mask_predict_outputs, cls_inputs = self.get_input_output_imglabel_by_imgid(
+                img_id)
+            mask_predict_inputs_ts.append(mask_predict_inputs)
+        mask_predict_inputs_ts = torch.tensor(
+            mask_predict_inputs_ts, device=device, dtype=torch.long)
+        mask_predict_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+            mask_predict_inputs_ts)
+        text_emb = self.bert.bert.embeddings.word_embeddings(input_ids)
+        batch_size = input_ids.size(0)
+
+        sep_emb = self.bert.bert.embeddings.word_embeddings(
+            torch.tensor(self.bert_tokenizer.sep_token_id, device=device, dtype=torch.long)).unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1)
+        img_emb = self.img_ff(img_emb).unsqueeze(1)
+        # logger.debug(f"{text_emb.size()}, {mask_predict_inputs_emb.size()}, {img_emb.size()}, {sep_emb.size()}")
+        mask_input_emb = torch.cat(
+            [text_emb, mask_predict_inputs_emb, img_emb, sep_emb], dim=1)
+
+        extra_len = mask_input_emb.size(1) - text_emb.size(1)
+        ones_mask2 = torch.ones(batch_size, extra_len, device=device)
+        attention_mask = torch.cat(
+            [attention_mask, ones_mask2], dim=1)
+
+        token_type_ids = torch.zeros_like(
+            attention_mask, dtype=torch.long)
+        token_type_ids[:, -extra_len:] = 1
+
+        mask_res = self.bert(inputs_embeds=mask_input_emb,
+                             attention_mask=attention_mask, token_type_ids=token_type_ids, return_dict=True, output_hidden_states=True)
+        mask_hidden_states = mask_res.hidden_states
+        start = text_emb.size(1)
+        end = text_emb.size(1) + mask_predict_inputs_emb.size(1)
+
+        mask_hidden_states = mask_hidden_states[-1][:, start:end, :]
+        logits = self.mlm_head(mask_hidden_states)
+        # logger.debug(logits.size())
+        tokenizer = self.bert_tokenizer
+        ids = logits.argmax(-1)[0]
+        # res = tokenizer(ids[0])
+        # logger.debug(res)
+        generated_ids = None
+        cls_id = tokenizer.cls_token_id
+        for i in range(len(ids) - 1, -1, -1):
+            if ids[i] == cls_id:
+                if i == len(ids) - 1:
+                    break
+                generated_ids = ids[i+1:]
+                break
+
+        if generated_ids is not None:
+            img_label = ''.join(tokenizer.convert_ids_to_tokens(generated_ids))
+            self.update_predict_ocr(img_ids[0], img_label, logits)
+
+    def test_img_emotion(self, input_ids, attention_mask, img_ids):
+        img_emb = self.get_emb_by_imgids(img_ids)
+        device = attention_mask.device
+        batch_size = img_emb.size(0)
+        sep_emb = self.bert.bert.embeddings.word_embeddings(
+            torch.tensor(self.bert_tokenizer.sep_token_id, device=device, dtype=torch.long)).unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1)
+        # logger.debug(text_emb.size())
+        text_emb = self.bert.bert.embeddings.word_embeddings(input_ids)
+        img_emb = self.img_ff(img_emb).unsqueeze(1)
+        assert self.args.add_ocr_info is True
+        if self.args.add_ocr_info:
+            # neg_mask_predict_inputs, neg_mask_predict_outputs, neg_cls_inputs = self.get_input_output_imglabel_by_imgid(neg_img_id)
+            # mask_predict_inputs_ts = []
+            # mask_predict_outputs_ts = []
+            cls_inputs_ts = []
+
+            for img_id in img_ids:
+                mask_predict_inputs, mask_predict_outputs, cls_inputs = self.get_input_output_imglabel_by_imgid(
+                    img_id)
+                # mask_predict_inputs_ts.append(mask_predict_inputs)
+                # mask_predict_outputs_ts.append(mask_predict_outputs)
+                cls_inputs_ts.append(cls_inputs)
+
+            # mask_predict_inputs_ts = torch.tensor(
+            #     mask_predict_inputs_ts, device=device, dtype=torch.long)
+            # mask_predict_outputs_ts = torch.tensor(
+            #     mask_predict_outputs_ts, device=device, dtype=torch.long)
+            cls_inputs_ts = torch.tensor(
+                cls_inputs_ts, device=device, dtype=torch.long)
+
+            # mask_predict_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+            #     mask_predict_inputs_ts)
+            cls_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+                cls_inputs_ts)
+
+            input_emb = torch.cat(
+                [text_emb, cls_inputs_emb, img_emb, sep_emb], dim=1)  # format
+
+            extra_len = input_emb.size(1) - text_emb.size(1)
+            ones_mask2 = torch.ones(batch_size, extra_len, device=device)
+            addocr_attention_mask = torch.cat(
+                [attention_mask, ones_mask2], dim=1)
+            labels = torch.ones(
+                batch_size, dtype=torch.long, device=device)
+
+            token_type_ids = torch.zeros_like(
+                addocr_attention_mask, dtype=torch.long)
+            token_type_ids[:, -extra_len:] = 1
+            res = self.bert(inputs_embeds=input_emb,
+                            attention_mask=addocr_attention_mask, labels=labels, token_type_ids=token_type_ids, return_dict=True, output_hidden_states=True)
+            hidden_states = res.hidden_states  # len=13, embedding + 12 layer
+            hidden_states = hidden_states[-1][:, -2, :]
+            logits = self.emotion_head(hidden_states)
+            return logits.argmax(-1)
+
+    def test_gradient(self, input_ids, attention_mask, img_ids):
+        img_emb = self.get_emb_by_imgids(img_ids)
+        device = attention_mask.device
+        batch_size = img_emb.size(0)
+        sep_emb = self.bert.bert.embeddings.word_embeddings(
+            torch.tensor(self.bert_tokenizer.sep_token_id, device=device, dtype=torch.long)).unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1)
+        # logger.debug(text_emb.size())
+        text_emb = self.bert.bert.embeddings.word_embeddings(input_ids)
+        img_emb = self.img_ff(img_emb).unsqueeze(1)
+        # print(type(self.bert))
+        assert self.args.add_ocr_info is True
+        if self.args.add_ocr_info:
+            # neg_mask_predict_inputs, neg_mask_predict_outputs, neg_cls_inputs = self.get_input_output_imglabel_by_imgid(neg_img_id)
+            # mask_predict_inputs_ts = []
+            # mask_predict_outputs_ts = []
+            cls_inputs_ts = []
+
+            for img_id in img_ids:
+                mask_predict_inputs, mask_predict_outputs, cls_inputs = self.get_input_output_imglabel_by_imgid(
+                    img_id)
+                # mask_predict_inputs_ts.append(mask_predict_inputs)
+                # mask_predict_outputs_ts.append(mask_predict_outputs)
+                cls_inputs_ts.append(cls_inputs)
+
+            # mask_predict_inputs_ts = torch.tensor(
+            #     mask_predict_inputs_ts, device=device, dtype=torch.long)
+            # mask_predict_outputs_ts = torch.tensor(
+            #     mask_predict_outputs_ts, device=device, dtype=torch.long)
+            cls_inputs_ts = torch.tensor(
+                cls_inputs_ts, device=device, dtype=torch.long)
+
+            # mask_predict_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+            #     mask_predict_inputs_ts)
+            cls_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+                cls_inputs_ts)
+
+            input_emb = torch.cat(
+                [text_emb, cls_inputs_emb, img_emb, sep_emb], dim=1)  # format
+
+            extra_len = input_emb.size(1) - text_emb.size(1)
+            ones_mask2 = torch.ones(batch_size, extra_len, device=device)
+            addocr_attention_mask = torch.cat(
+                [attention_mask, ones_mask2], dim=1)
+            labels = torch.ones(
+                batch_size, dtype=torch.long, device=device)
+
+            token_type_ids = torch.zeros_like(
+                addocr_attention_mask, dtype=torch.long)
+            token_type_ids[:, -extra_len:] = 1
+            res = self.bert(inputs_embeds=input_emb,
+                            attention_mask=addocr_attention_mask, labels=labels, token_type_ids=token_type_ids, return_dict=True, output_hidden_states=True)
+            logits = res.logits
+            success = (logits.argmax(-1) == labels).item()
+            hidden_states = res.hidden_states  # len=13, embedding + 12 layer
+            # hidden_states = hidden_states[-1][:, -2, :]
+            embeddings = hidden_states[0]
+            embeddings.retain_grad()
+            loss = res.loss
+            loss.backward()
+            # print(embeddings.size())
+            # print(embeddings.grad)
+            # print(embeddings.grad.size())
+            # ret_grad = embeddings.grad.detach().clone()
+            # print(torch.autograd.grad(loss, embeddings, retain_graph=True))
+            # logits = self.emotion_head(hidden_states)
+            # return logits.argmax(-1)
+            self.zero_grad() # 不会清空中间变量的grad
+            # for name, v in self.named_parameters():
+            #     print(name)
+            # self.bert.zero_grad()
+            # print(embeddings.grad)
+            # print(embeddings.grad.size())
+            return embeddings.grad, success
+            
+
+    def forward(self, input_ids, attention_mask, batch_idx=1, neg_img_ids=None, img_ids=None, emotion_ids=None, user_ids=None, img_tokens=None, neg_img_tokens=None,
+                test=False, cands=None, mask_context_input_ids=None, mask_context_output_ids=None, mask_context_attention_mask=None):
+
+        if self.args.mode == 'predict_img_label':
+            return self.predict_img_label(input_ids=input_ids, attention_mask=attention_mask, batch_idx=batch_idx, img_ids=img_ids)
+
+        if self.args.mode == 'predict_emotion':
+            return self.test_img_emotion(input_ids=input_ids, attention_mask=attention_mask, img_ids=img_ids)
+
+        if self.args.mode == 'test_gradient':
+            return self.test_gradient(input_ids=input_ids, attention_mask=attention_mask, img_ids=img_ids)
+
+        if not test:
+            # 训练路径：每条样本构造一对 (正例贴纸, 负例贴纸)，
+            # 仍按原论文/原实现的二分类训练，不改任务定义。
+            img_emb = self.get_emb_by_imgids(img_ids)
+            neg_img_emb = self.get_emb_by_imgids(neg_img_ids)
+        else:
+            # 测试路径：一次前向对“候选集合”打分。
+            # - cands 不为空：R10（10候选）
+            # - cands 为空：Rall（全贴纸候选）
+            if cands:
+                assert len(cands) == 1
+                cands = cands[0]
+                img_emb = self.all_img_embs[cands]
+                if self.args.add_ocr_info:
+                    cls_inputs_ts = []
+
+                    for img_id in cands:
+                        mask_predict_inputs, mask_predict_outputs, cls_inputs = self.get_input_output_imglabel_by_imgid(
+                            img_id)
+                        cls_inputs_ts.append(cls_inputs)
+                    cls_inputs_ts = torch.tensor(
+                        cls_inputs_ts, device=self.all_img_embs.device, dtype=torch.long)
+                    cls_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+                        cls_inputs_ts)
+            else:
+                img_emb = self.all_img_embs
+                if self.args.add_ocr_info:
+                    cls_inputs_ts = []
+
+                    for img_id in range(self.args.max_image_id):
+                        mask_predict_inputs, mask_predict_outputs, cls_inputs = self.get_input_output_imglabel_by_imgid(
+                            img_id)
+                        cls_inputs_ts.append(cls_inputs)
+                    cls_inputs_ts = torch.tensor(
+                        cls_inputs_ts, device=self.all_img_embs.device, dtype=torch.long)
+                    cls_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+                        cls_inputs_ts)
+        # logger.info(f'unique img ids num:{len(list(set(img_ids)))}')
+
+        if not test:
+            device = attention_mask.device
+            batch_size = img_emb.size(0)
+            sep_emb = self.bert.bert.embeddings.word_embeddings(
+                torch.tensor(self.bert_tokenizer.sep_token_id, device=device, dtype=torch.long)).unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1)
+            # logger.debug(text_emb.size())
+            text_emb = self.bert.bert.embeddings.word_embeddings(input_ids)
+            if self.args.use_visual_personalization_token:
+                if user_ids is None:
+                    user_ids = ['__UNK__'] * batch_size
+                loo_current_img_ids = self._get_loo_current_img_ids(
+                    img_ids=img_ids, test=test)
+                user_token = self._build_user_token(
+                    user_ids=user_ids, current_img_ids=loo_current_img_ids, device=device)
+                img_emb = self.sticker_token_proj(img_emb).unsqueeze(1)
+                neg_img_emb = self.sticker_token_proj(neg_img_emb).unsqueeze(1)
+            else:
+                img_emb = self.img_ff(img_emb).unsqueeze(1)
+                neg_img_emb = self.img_ff(neg_img_emb).unsqueeze(1)
+            if self.args.add_ocr_info:
+                # neg_mask_predict_inputs, neg_mask_predict_outputs, neg_cls_inputs = self.get_input_output_imglabel_by_imgid(neg_img_id)
+                # mask_predict_inputs_ts = []
+                # mask_predict_outputs_ts = []
+                cls_inputs_ts = []
+                neg_cls_inputs_ts = []
+
+                for img_id in img_ids:
+                    mask_predict_inputs, mask_predict_outputs, cls_inputs = self.get_input_output_imglabel_by_imgid(
+                        img_id)
+                    # mask_predict_inputs_ts.append(mask_predict_inputs)
+                    # mask_predict_outputs_ts.append(mask_predict_outputs)
+                    cls_inputs_ts.append(cls_inputs)
+
+                for img_id in neg_img_ids:
+                    mask_predict_inputs, mask_predict_outputs, cls_inputs = self.get_input_output_imglabel_by_imgid(
+                        img_id)
+                    neg_cls_inputs_ts.append(cls_inputs)
+
+                # mask_predict_inputs_ts = torch.tensor(
+                #     mask_predict_inputs_ts, device=device, dtype=torch.long)
+                # mask_predict_outputs_ts = torch.tensor(
+                #     mask_predict_outputs_ts, device=device, dtype=torch.long)
+                cls_inputs_ts = torch.tensor(
+                    cls_inputs_ts, device=device, dtype=torch.long)
+                neg_cls_inputs_ts = torch.tensor(
+                    neg_cls_inputs_ts, device=device, dtype=torch.long)
+
+                # mask_predict_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+                #     mask_predict_inputs_ts)
+                cls_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+                    cls_inputs_ts)
+                neg_cls_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+                    neg_cls_inputs_ts)
+
+                if self.args.use_visual_personalization_token:
+                    input_emb, addocr_attention_mask, token_type_ids = self._compose_personalized_inputs(
+                        text_emb=text_emb,
+                        attention_mask=attention_mask,
+                        sticker_token=img_emb,
+                        user_token=user_token,
+                        aux_emb=cls_inputs_emb,
+                    )
+                    neg_input_emb, _, _ = self._compose_personalized_inputs(
+                        text_emb=text_emb,
+                        attention_mask=attention_mask,
+                        sticker_token=neg_img_emb,
+                        user_token=user_token,
+                        aux_emb=neg_cls_inputs_emb,
+                    )
+                else:
+                    input_emb = torch.cat(
+                        [text_emb, cls_inputs_emb, img_emb, sep_emb], dim=1)  # format
+                    extra_len = input_emb.size(1) - text_emb.size(1)
+                    ones_mask2 = torch.ones(batch_size, extra_len, device=device)
+                    addocr_attention_mask = torch.cat(
+                        [attention_mask, ones_mask2], dim=1)
+                    token_type_ids = torch.zeros_like(
+                        addocr_attention_mask, dtype=torch.long)
+                    token_type_ids[:, -extra_len:] = 1
+                    neg_input_emb = torch.cat(
+                        [text_emb, neg_cls_inputs_emb, neg_img_emb, sep_emb], dim=1)
+                labels = torch.ones(
+                    batch_size, dtype=torch.long, device=device)
+                neg_labels = torch.zeros(
+                    batch_size, dtype=torch.long, device=device)
+                # 主任务保持不变：
+                # CE(正例=1) + CE(负例=0) 再取平均，不引入额外 ranking/residual loss。
+                res = self.bert(inputs_embeds=input_emb,
+                                attention_mask=addocr_attention_mask, labels=labels, token_type_ids=token_type_ids, return_dict=True, output_hidden_states=True)
+                loss = res.loss
+                neg_res = self.bert(inputs_embeds=neg_input_emb,
+                                    attention_mask=addocr_attention_mask, labels=neg_labels, token_type_ids=token_type_ids, return_dict=True, output_hidden_states=True)
+                neg_loss = neg_res.loss
+                cls_loss = (loss + neg_loss) / 2
+                # if self.args.add_predict_img_label_task:
+                #     mask_input_emb = torch.cat(
+                #         [text_emb, mask_predict_inputs_emb, img_emb, sep_emb], dim=1)
+
+                #     mask_res = self.bert(inputs_embeds=mask_input_emb,
+                #                         attention_mask=attention_mask, token_type_ids=token_type_ids, return_dict=True, output_hidden_states=True)
+                #     mask_hidden_states = mask_res.hidden_states
+                #     start = text_emb.size(1)
+                #     end = text_emb.size(1) + mask_predict_inputs_emb.size(1)
+
+                #     mask_hidden_states = mask_hidden_states[-1][:, start:end, :]
+                #     logits = self.mlm_head(mask_hidden_states)
+                #     # shifted_prediction_scores = logits[:, :-1, :].contiguous()
+                #     # labels = mask_predict_outputs_ts[:, 1:].contiguous()
+                #     labels = mask_predict_outputs_ts
+                #     loss_fct = torch.nn.CrossEntropyLoss()
+                #     mask_loss = loss_fct(
+                #         logits.view(-1, len(self.bert_tokenizer)), labels.view(-1))
+                #     final_loss = cls_loss + self.args.label_weight * mask_loss
+                # else:
+                final_loss = cls_loss
+
+            else:
+                if self.args.use_visual_personalization_token:
+                    input_emb, noaddocr_attention_mask, token_type_ids = self._compose_personalized_inputs(
+                        text_emb=text_emb,
+                        attention_mask=attention_mask,
+                        sticker_token=img_emb,
+                        user_token=user_token,
+                        aux_emb=None,
+                    )
+                    neg_input_emb, _, _ = self._compose_personalized_inputs(
+                        text_emb=text_emb,
+                        attention_mask=attention_mask,
+                        sticker_token=neg_img_emb,
+                        user_token=user_token,
+                        aux_emb=None,
+                    )
+                else:
+                    input_emb = torch.cat(
+                        [text_emb, img_emb, sep_emb], dim=1)
+                    ones_mask2 = torch.ones(batch_size, 2, device=device)
+                    noaddocr_attention_mask = torch.cat(
+                        [attention_mask, ones_mask2], dim=1)
+                    token_type_ids = torch.zeros_like(
+                        noaddocr_attention_mask, dtype=torch.long)
+                    token_type_ids[:, -2:] = 1
+                    neg_input_emb = torch.cat(
+                        [text_emb, neg_img_emb, sep_emb], dim=1)
+                labels = torch.ones(
+                    batch_size, dtype=torch.long, device=device)
+                neg_labels = torch.zeros(
+                    batch_size, dtype=torch.long, device=device)
+                # logger.debug(token_type_ids.dtype)
+                res = self.bert(inputs_embeds=input_emb,
+                                attention_mask=noaddocr_attention_mask, labels=labels, token_type_ids=token_type_ids, return_dict=True, output_hidden_states=True)
+                loss = res.loss
+                neg_res = self.bert(inputs_embeds=neg_input_emb,
+                                    attention_mask=noaddocr_attention_mask, labels=neg_labels, token_type_ids=token_type_ids, return_dict=True, output_hidden_states=True)
+                neg_loss = neg_res.loss
+                cls_loss = (loss + neg_loss) / 2
+                final_loss = cls_loss
+
+            if self.args.add_predict_img_label_task:
+                mask_predict_inputs_ts = []
+                mask_predict_outputs_ts = []
+
+                for img_id in img_ids:
+                    mask_predict_inputs, mask_predict_outputs, cls_inputs = self.get_input_output_imglabel_by_imgid(
+                        img_id)
+                    mask_predict_inputs_ts.append(mask_predict_inputs)
+                    mask_predict_outputs_ts.append(mask_predict_outputs)
+
+                mask_predict_inputs_ts = torch.tensor(
+                    mask_predict_inputs_ts, device=device, dtype=torch.long)
+                mask_predict_outputs_ts = torch.tensor(
+                    mask_predict_outputs_ts, device=device, dtype=torch.long)
+
+                mask_predict_inputs_emb = self.bert.bert.embeddings.word_embeddings(
+                    mask_predict_inputs_ts)
+                mask_input_emb = torch.cat(
+                    [text_emb, mask_predict_inputs_emb, img_emb, sep_emb], dim=1)
+
+                predlabel_extra_len = mask_input_emb.size(1) - text_emb.size(1)
+                predlabel_ones_mask2 = torch.ones(
+                    batch_size, predlabel_extra_len, device=device)
+                predlabel_attention_mask = torch.cat(
+                    [attention_mask, predlabel_ones_mask2], dim=1)
+
+                token_type_ids = torch.zeros_like(
+                    predlabel_attention_mask, dtype=torch.long)
+                token_type_ids[:, -predlabel_extra_len:] = 1
+
+                mask_res = self.bert(inputs_embeds=mask_input_emb,
+                                     attention_mask=predlabel_attention_mask, token_type_ids=token_type_ids, return_dict=True, output_hidden_states=True)
+                mask_hidden_states = mask_res.hidden_states
+                start = text_emb.size(1)
+                end = text_emb.size(1) + mask_predict_inputs_emb.size(1)
+
+                mask_hidden_states = mask_hidden_states[-1][:, start:end, :]
+                logits = self.mlm_head(mask_hidden_states)
+                # shifted_prediction_scores = logits[:, :-1, :].contiguous()
+                # labels = mask_predict_outputs_ts[:, 1:].contiguous()
+                labels = mask_predict_outputs_ts
+                loss_fct = torch.nn.CrossEntropyLoss()
+                mask_loss = loss_fct(
+                    logits.view(-1, len(self.bert_tokenizer)), labels.view(-1))
+                final_loss = final_loss + self.args.label_weight * mask_loss
+
+            if self.args.add_emotion_task:
+                hidden_states = res.hidden_states  # len=13, embedding + 12 layer
+                hidden_states = hidden_states[-1][:, -2, :]
+                logits = self.emotion_head(hidden_states)
+                emotion_labels = torch.tensor(
+                    emotion_ids, dtype=torch.long, device=device)
+                loss_fct = torch.nn.CrossEntropyLoss()
+                emotion_loss = loss_fct(logits, emotion_labels)
+                if batch_idx % 1000 == 0:
+                    logger.debug(f'{cls_loss}, {emotion_loss}')
+                # return cls_loss + 0.1 * emotion_loss,
+                final_loss = final_loss + self.args.emotion_weight * emotion_loss
+
+            if self.args.add_predict_context_task:
+                mask_context_text_emb = self.bert.bert.embeddings.word_embeddings(
+                    mask_context_input_ids)
+                if self.args.add_ocr_info:
+                    mask_context_input_emb = torch.cat(
+                        [mask_context_text_emb, cls_inputs_emb, img_emb, sep_emb], dim=1)
+                    ctx_extra_len = mask_context_input_emb.size(1) - mask_context_text_emb.size(1)
+                    ones_mask2 = torch.ones(batch_size, ctx_extra_len, device=device)
+                    mask_context_attention_mask = torch.cat(
+                        [mask_context_attention_mask, ones_mask2], dim=1)
+                    mask_context_token_type_ids = torch.zeros_like(
+                        mask_context_attention_mask, dtype=torch.long)
+                    mask_context_token_type_ids[:, -ctx_extra_len:] = 1
+                else:
+                    mask_context_input_emb = torch.cat(
+                        [mask_context_text_emb, img_emb, sep_emb], dim=1)
+                    ctx_extra_len = mask_context_input_emb.size(1) - mask_context_text_emb.size(1)
+                    ones_mask2 = torch.ones(batch_size, ctx_extra_len, device=device)
+                    mask_context_attention_mask = torch.cat(
+                        [mask_context_attention_mask, ones_mask2], dim=1)
+                    mask_context_token_type_ids = torch.zeros_like(
+                        mask_context_attention_mask, dtype=torch.long)
+                    mask_context_token_type_ids[:, -ctx_extra_len:] = 1
+
+                mask_context_res = self.bert(inputs_embeds=mask_context_input_emb,
+                                             attention_mask=mask_context_attention_mask, token_type_ids=mask_context_token_type_ids, return_dict=True, output_hidden_states=True)
+                # len=13, embedding + 12 layer
+                mask_context_hidden_states = mask_context_res.hidden_states
+                mask_context_hidden_states = mask_context_hidden_states[-1][:, :mask_context_output_ids.size(
+                    1), :]
+                logits = self.mlm_head(mask_context_hidden_states)
+                # shifted_prediction_scores = logits[:, :-1, :].contiguous()
+                # labels = mask_context_output_ids[:, 1:].contiguous()
+                labels = mask_context_output_ids
+                loss_fct = torch.nn.CrossEntropyLoss()
+                mask_context_loss = loss_fct(
+                    logits.view(-1, len(self.bert_tokenizer)), labels.view(-1))
+                final_loss = final_loss + self.args.ctx_weight * mask_context_loss
+            if batch_idx % 1000 == 0:
+                mask_loss = mask_loss if 'mask_loss' in dir() else None
+                emotion_loss = emotion_loss if 'emotion_loss' in dir() else None
+                mask_context_loss = mask_context_loss if 'mask_context_loss' in dir() else None
+                logger.debug(
+                    f"cls_loss:{cls_loss}, mask_loss:{mask_loss}, emotion_loss:{emotion_loss}, mask_context_loss:{mask_context_loss}")
+            return final_loss,
+        else:
+            device = attention_mask.device
+            batch_size = input_ids.size(0)
+            assert batch_size == 1
+            img_num = img_emb.size(0)
+            sep_emb = self.bert.bert.embeddings.word_embeddings(
+                torch.tensor(self.bert_tokenizer.sep_token_id, device=device, dtype=torch.long)).unsqueeze(0).unsqueeze(0).repeat(img_num, 1, 1)
+            # logger.debug(text_emb.size())
+            text_emb = self.bert.bert.embeddings.word_embeddings(input_ids)
+            text_emb = text_emb.repeat(img_num, 1, 1)
+            if self.args.use_visual_personalization_token:
+                if user_ids is None:
+                    user_ids = ['__UNK__']
+                loo_current_img_ids = self._get_loo_current_img_ids(
+                    img_ids=img_ids, test=test)
+                user_token = self._build_user_token(
+                    user_ids=user_ids, current_img_ids=loo_current_img_ids, device=device)
+                user_token = user_token.repeat(img_num, 1, 1)
+                img_emb = self.sticker_token_proj(img_emb).unsqueeze(1)
+                if self.args.add_ocr_info:
+                    input_emb, _, token_type_ids = self._compose_personalized_inputs(
+                        text_emb=text_emb,
+                        attention_mask=attention_mask.repeat(img_num, 1),
+                        sticker_token=img_emb,
+                        user_token=user_token,
+                        aux_emb=cls_inputs_emb,
+                    )
+                else:
+                    input_emb, _, token_type_ids = self._compose_personalized_inputs(
+                        text_emb=text_emb,
+                        attention_mask=attention_mask.repeat(img_num, 1),
+                        sticker_token=img_emb,
+                        user_token=user_token,
+                        aux_emb=None,
+                    )
+            else:
+                img_emb = self.img_ff(img_emb).unsqueeze(1)
+                if self.args.add_ocr_info:
+                    input_emb = torch.cat(
+                        [text_emb, cls_inputs_emb, img_emb, sep_emb], dim=1)
+                else:
+                    input_emb = torch.cat(
+                        [text_emb, img_emb, sep_emb], dim=1)
+                extra_len = input_emb.size(1) - text_emb.size(1)
+                token_type_ids = torch.zeros(size=(input_emb.size(
+                    0), input_emb.size(1)), device=device, dtype=torch.long)
+                token_type_ids[:, -extra_len:] = 1
+            res = self.bert(inputs_embeds=input_emb,
+                            token_type_ids=token_type_ids, return_dict=True)
+            # logger.debug(res.logits.size())
+            logits = res.logits[:, 1].unsqueeze(0)
+            labels = torch.tensor(img_ids, dtype=torch.long, device=device)
+            return logits, labels, cands
+
+    def prepare_imgs(self, args):
+        self.args = args
+        if self.args.model_choice == 'use_img_id':
+            return
+        img_dir = args.img_dir
+        self.id2img = {}
+        if self.args.model_choice == 'use_clip_repo':
+            self.img_process = self.clip_process
+        else:
+            if hasattr(self.img_clip, 'preprocess'):
+                self.img_process = self.img_clip.preprocess
+            else:
+                self.img_process = self.img_clip._first_module().preprocess
+        logger.info("prepare img objs")
+        self.id2imgpath = {}
+
+        with open(args.id2img_path, encoding='utf-8') as f:
+            id2img = json.load(f)
+            for id, img in tqdm(id2img.items()):
+                id = int(id)
+                self.id2imgpath[id] = img
+
+        # if args.fix_clip:
+        #     logger.info('fix clip!')
+        #     for p in self.img_clip.parameters():
+        #         p.requires_grad = False
+
+        # if self.args.mode != 'gen':
+        #     assert self.text_clip.training == True
+        #     assert self.img_clip.training == True
+
+    def get_input_embeddings_with_segment(self, input_ids, segment_ids):
+        # position_ids will be computed by the model itself even if the inputs_embeds is given
+        # position_ids = torch.arange(input_ids.size(-1), device=input_ids.device).unsqueeze(0)
+        # logger.debug(f"{self.transformer.wte(input_ids).size()}, {self.transformer.wpe(position_ids).size()}, {self.segment_embedding(segment_ids).size()}")
+        img_mask = (segment_ids == 2)
+        text_mask = (segment_ids != 2)
+        text_embedding = self.bert.embeddings.word_embeddings(
+            input_ids) * (text_mask.unsqueeze(-1))
+        img_pos = img_mask.nonzero(as_tuple=True)
+        img_ids = input_ids[img_pos]
+        img_objs = []
+        for i, id in enumerate(img_ids):
+            img_obj = self.id2img[id.item()]
+            img_objs.append(img_obj)
+
+        if img_objs:
+
+            img_tokens = self.img_clip.tokenize(img_objs)
+            img_tokens = batch_to_device(
+                img_tokens, self.img_clip._target_device)
+            # img_emb = self.img_clip.encode(img_objs, convert_to_tensor=True)
+            # img_emb.requires_grad = True
+            # print(img_emb.size())
+            # img_emb = img_emb.to(input_ids.device)
+            img_emb = self.img_clip.forward(img_tokens)['sentence_embedding']
+            if self.args.mode == 'gen':
+                assert self.img_clip.training == False
+            emb = self.img_ff(img_emb)
+            # text_embedding[img_pos[0][i], img_pos[1][i]] = emb
+            # logger.debug(f"emb: {emb.requires_grad}")
+            zeros = torch.zeros_like(text_embedding, device=input_ids.device)
+            zeros[img_pos] = emb
+            # text_embedding[img_pos] = emb
+            # logger.debug(f"zeros:{zeros.requires_grad}")
+            text_embedding = text_embedding + zeros
+
+        # img_emb = self.img_clip.encode(img_objs, convert_to_tensor=True)
+        # # print(img_emb.size())
+        # img_emb = img_emb.to(input_ids.device)
+        # emb = self.img_ff(img_emb)
+        # # text_embedding[img_pos[0][i], img_pos[1][i]] = emb
+        # text_embedding[img_pos] = emb
+
+        return text_embedding + self.segment_embedding(
+            segment_ids)
+
+
+class PLDataset(Dataset):
+    def __init__(self, path, mode, args, tokenizer):
+        with open(path, encoding='utf-8') as f:
+            self.data = json.load(f)
+        # self.tokenizer = tokenizer
+        self.mode = mode
+        self.args = args
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.data)
+
+    def random_mask(self, text_ids, return_ts):
+        # random mask for MLM
+        input_ids, output_ids = [], []
+        rands = np.random.random(len(text_ids))
+        mask_id = self.tokenizer.mask_token_id
+        l = len(self.tokenizer)
+        for r, i in zip(rands, text_ids):
+            # if i == helper.sep_id or i == helper.cls_id:
+            #     input_ids.append(i)
+            #     output_ids.append(-100)
+            #     continue
+            if r < 0.15 * 0.8:
+                input_ids.append(mask_id)
+                output_ids.append(i)
+            elif r < 0.15 * 0.9:
+                input_ids.append(i)
+                output_ids.append(i)
+            elif r < 0.15:
+                input_ids.append(np.random.choice(l))
+                output_ids.append(i)
+            else:
+                input_ids.append(i)
+                output_ids.append(-100)
+        if return_ts:
+            # logger.debug(f"input_ids: {input_ids}, output_ids: {output_ids}")
+            return torch.tensor(input_ids, dtype=torch.long), torch.tensor(
+                output_ids, dtype=torch.long)
+        else:
+            return input_ids, output_ids
+
+    def __getitem__(self, index):
+        sample = self.data[index]
+        dialog = sample['dialog']
+        sent_num = self.args.sent_num
+        if sent_num == 0:
+            selected_dialog = dialog
+        else:
+            selected_dialog = dialog[-sent_num:]
+        sent = ''
+        img_id = None
+
+        def pad_none(x, l=5):
+            return x + [None] * (l - len(x))
+        for i, d in enumerate(selected_dialog):
+            if i == len(selected_dialog) - 1:
+                # s, img_id, img_word, neg_img_id, neg_img_word = pad_none(d, 5)
+                s = d.get('text', None)
+                img_id = d.get('img_id', None)
+                img_word = d.get('img_label', None)
+                neg_img_id = d.get('neg_img_id', None)
+                neg_img_word = d.get('neg_img_label', None)
+                emotion_id = d.get('emotion_id', None)
+            else:
+                # s, _, _ = d
+                s = d['text']
+            sent += s
+        # sent, img_id, img_word, neg_img_id, neg_img_word = dialog[-1]
+        # img_id = int(img_id)
+        # sent = sent.replace('[speaker1]', '').replace('[speaker2]', '')
+
+        if self.args.add_predict_context_task:
+            sent_ids = self.tokenizer.encode(sent)
+            # logger.debug(sent_ids)
+            mask_context_input_ids, mask_context_output_ids = self.random_mask(
+                sent_ids, return_ts=True)
+            # logger.debug(mask_context_input_ids)
+#
+            mask_context_attention_mask = torch.ones(
+                len(mask_context_input_ids), dtype=torch.float)
+        else:
+            mask_context_input_ids, mask_context_output_ids = None, None
+            mask_context_attention_mask = None
+
+        if self.args.test_with_cand:
+            cand = [id for id in sample['cand']]
+
+        else:
+            cand = None
+        user_id = _resolve_user_key(sample, dialog, index)
+
+        res = {
+            'sent': sent,
+            'img_word': img_word,
+            'img_id': img_id,
+            'neg_img_word': neg_img_word,
+            'neg_img_id': neg_img_id,
+            'user_id': user_id,
+            'emotion_id': emotion_id,
+            'cand': cand,
+            'mask_context_output_ids': mask_context_output_ids,
+            'mask_context_input_ids': mask_context_input_ids,
+            'mask_context_attention_mask': mask_context_attention_mask
+        }
+        return res
+        # return {k:v for k, v in res.items() if v is not None}
+
+        if not self.args.test_with_cand:
+            return {
+                'sent': sent,
+                'img_word': img_word,
+                'img_id': img_id,
+                'neg_img_word': neg_img_word,
+                'neg_img_id': neg_img_id,
+                'emotion_id': emotion_id,
+            }
+        else:
+            return {
+                'sent': sent,
+                'img_word': img_word,
+                'img_id': img_id,
+                'neg_img_word': neg_img_word,
+                'neg_img_id': neg_img_id,
+                'cand': [id for id in self.data[index]['cand']]
+            }
+
+
+class PLDataLoader(pl.LightningDataModule):
+    def __init__(self, args, tokenizer):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.train_data_path = args.train_data_path
+        self.val_data_path = args.val_data_path
+        self.test_data_path = args.test_data_path
+        self.train_batch_size = args.train_batch_size
+        self.valtest_batch_size = args.valtest_batch_size
+        self.gen_data_path = args.gen_data_path
+        self.gen_batch_size = args.gen_batch_size
+        self.args = args
+
+    def setup(self, stage: Optional[str] = None):
+        if stage == 'fit' or stage is None:
+            logger.info('begin get data')
+
+            self.train_dataset = PLDataset(self.train_data_path,
+                                           self.args.mode, self.args, self.tokenizer)
+            if self.args.val_data_path:
+                self.val_dataset = PLDataset(
+                    self.val_data_path, self.args.mode, self.args, self.tokenizer)
+                logger.info('has val!')
+            else:
+                logger.info('no val!')
+            logger.info('finish get data')
+
+        if stage == 'test' or stage is None:
+            logger.info('begin get data')
+            if self.args.mode != 'gen':
+                self.test_dataset = PLDataset(
+                    self.test_data_path, self.args.mode, self.args, self.tokenizer)
+            else:
+                self.test_dataset = PLDataset(
+                    self.gen_data_path, self.args.mode, self.args, self.tokenizer)
+            logger.info('finish get data')
+
+    def collate_fn(self, batch):
+        # logger.debug(batch)
+        sents = [d['sent'] for d in batch]
+        # img_words = [d['img_word'] for d in batch]
+        img_ids = [d['img_id'] for d in batch]
+        # neg_img_words = [d['neg_img_word'] for d in batch]
+        neg_img_ids = [d['neg_img_id'] for d in batch]
+        user_ids = [d['user_id'] for d in batch]
+        chunk = 490
+        res = self.tokenizer(sents, return_tensors='pt',
+                             padding=True, truncation=True, max_length=chunk)
+        input_ids = res['input_ids']
+        attention_mask = res['attention_mask']
+        # R10 评测时，每条样本带固定候选 cand（长度通常是 10）。
+        if batch[0]['cand'] is not None:
+            cands = [d['cand'] for d in batch]
+        else:
+            cands = None
+
+        if batch[0]['emotion_id'] is not None:
+            emotion_ids = [d['emotion_id'] for d in batch]
+        else:
+            emotion_ids = None
+
+        if batch[0]['mask_context_input_ids'] is not None:
+            # chunk = 500
+            mask_context_input_ids = pad_sequence(
+                [d['mask_context_input_ids'][-chunk:] for d in batch], batch_first=True, padding_value=self.tokenizer.pad_token_id)
+            mask_context_output_ids = pad_sequence(
+                [d['mask_context_output_ids'][-chunk:] for d in batch], batch_first=True, padding_value=-100)
+            mask_context_attention_mask = pad_sequence(
+                [d['mask_context_attention_mask'][-chunk:] for d in batch], batch_first=True, padding_value=0)
+        else:
+            mask_context_input_ids = None
+            mask_context_output_ids = None
+            mask_context_attention_mask = None
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'img_ids': img_ids,
+            'neg_img_ids': neg_img_ids,
+            'user_ids': user_ids,
+            'cands': cands,
+            'emotion_ids': emotion_ids,
+            'mask_context_input_ids': mask_context_input_ids,
+            'mask_context_output_ids': mask_context_output_ids,
+            'mask_context_attention_mask': mask_context_attention_mask,
+        }
+
+        if self.args.test_with_cand:
+            cands = [d['cand'] for d in batch]
+            return {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'img_ids': img_ids,
+                'neg_img_ids': neg_img_ids,
+                'cands': cands
+            }
+        else:
+            emotion_ids = [d['emotion_id'] for d in batch]
+            return {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'img_ids': img_ids,
+                'neg_img_ids': neg_img_ids,
+                'emotion_ids': emotion_ids
+            }
+
+    def train_dataloader(self, ):
+        return DataLoader(self.train_dataset,
+                          batch_size=self.train_batch_size,
+                          num_workers=self.args.num_workers,
+                          pin_memory=True,
+                          shuffle=True,
+                          collate_fn=self.collate_fn)
+
+    def val_dataloader(self):
+        # return None
+        if self.args.val_data_path:
+            return DataLoader(self.val_dataset,
+                              batch_size=self.valtest_batch_size,
+                              num_workers=self.args.num_workers,
+                              pin_memory=True,
+                              shuffle=False,
+                              collate_fn=self.collate_fn)
+        else:
+            return None
+
+    def test_dataloader(self):
+        batch_size = self.valtest_batch_size if self.args.mode != 'gen' else self.gen_batch_size
+        return DataLoader(self.test_dataset,
+                          batch_size=batch_size,
+                          num_workers=self.args.num_workers,
+                          pin_memory=True,
+                          shuffle=False,
+                          collate_fn=self.collate_fn)
+
+
+class PLModel(pl.LightningModule):
+    def __init__(self, args):
+        super().__init__()
+        # self.tokenizer = AutoTokenizer.from_pretrained(args.pretrain_path)
+        # logger.info(f"tokenizer type:{type(self.tokenizer)}")(
+        self.model = Model(args)
+        # special_tokens_dict = {
+        #     # 'pad_token': '[PAD]',
+        #     'additional_special_tokens': ['[speaker1]', '[speaker2]', '[img]']
+        # }
+        # self.tokenizer.add_special_tokens(special_tokens_dict)
+        # logger.info(
+        #     f"tokenizer add special tokens dict: {special_tokens_dict}")
+        # self.model.resize_token_embeddings(len(self.tokenizer))
+        # self.lr = args.lr
+        # self.acc = MyAccuracy(device=torch.device("cuda"))
+        # self.train_acc5 = MyAccuracy()
+        # self.train_acc30 = MyAccuracy()
+        # self.train_acc90 = MyAccuracy()
+        self.train_acc = MyAccuracy()
+        self.valtest_acc5 = MyAccuracy()
+        self.valtest_acc30 = MyAccuracy()
+        self.valtest_acc90 = MyAccuracy()
+        self.valtest_map = MyAccuracy()
+        self.args = args
+        self.model.prepare_imgs(args)
+        self.id2name = {}
+        with open('./data/id2name.json', encoding='utf-8') as f:
+            a = json.load(f)
+            for k, v in a.items():
+                self.id2name[int(k)] = v
+
+    def run_model_from_batch(self, batch, batch_idx, test=False):
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+        # img_tokens = batch['img_tokens']
+        img_ids = batch['img_ids']
+        # neg_img_tokens = batch['neg_img_tokens']
+        neg_img_ids = batch['neg_img_ids']
+        user_ids = batch.get('user_ids', None)
+        cands = batch.get('cands', None)
+        emotion_ids = batch.get('emotion_ids', None)
+        mask_context_input_ids = batch.get('mask_context_input_ids', None)
+        mask_context_output_ids = batch.get('mask_context_output_ids', None)
+        mask_context_attention_mask = batch.get(
+            'mask_context_attention_mask', None)
+
+        return self.model(batch_idx=batch_idx, input_ids=input_ids, attention_mask=attention_mask, img_ids=img_ids, neg_img_ids=neg_img_ids, user_ids=user_ids,
+                          test=test, cands=cands, emotion_ids=emotion_ids, mask_context_input_ids=mask_context_input_ids, mask_context_output_ids=mask_context_output_ids,
+                          mask_context_attention_mask=mask_context_attention_mask)
+
+    def compute_acc(self, sorted_idx, labels, k=5):
+        idx = sorted_idx[:, :k]
+        labels = labels.unsqueeze(-1).expand_as(idx)
+        cor_ts = torch.eq(idx, labels).any(dim=-1)
+        cor = cor_ts.sum()
+        total = cor_ts.numel()
+        return cor, total
+
+    def compute_map(self, sorted_idx, labels):
+        l = labels.unsqueeze(-1)
+        w = sorted_idx == l
+        _, idx = w.nonzero(as_tuple=True)
+        s = 1. / (idx + 1)
+        return torch.sum(s), labels.size(0)
+
+    def training_step(self, batch, batch_idx):
+        # logger.debug(batch)
+        outputs = self.run_model_from_batch(batch, batch_idx)
+
+        loss = outputs[0]
+
+        self.log('train_loss', loss)
+        # logger.info(f"loss:{loss}")
+        return loss
+
+    def training_step_end(self, *args, **kwargs):
+        self.model.temperature.data = torch.clamp(
+            self.model.temperature.data, 0, np.log(100))
+        return super().training_step_end(*args, **kwargs)
+
+    def on_validation_epoch_start(self) -> None:
+        # if self.args.val_data_path:
+        self.model.prepare_for_test()
+        return super().on_validation_epoch_start()
+
+    def log_res(self, batch, sorted_idx, batch_idx, k=5):
+        # valtest batch size == 1
+        return
+        label = batch['img_ids'][0]
+        input_ids = batch['input_ids']
+        input_text = self.model.bert_tokenizer.decode(
+            input_ids.squeeze(0).tolist())
+        topk_idx = sorted_idx[0, :k].tolist()
+        label_text = self.id2name[label]
+        cands = batch.get('cands', None)
+        if cands:
+            # logger.debug(topk_idx, cands)
+            topk_idx = [cands[0][idx] for idx in topk_idx]
+            # assert label in topk_idx
+
+        topk_text = [self.id2name[idx] for idx in topk_idx]
+        logger.info(
+            f"input_text:{input_text}, label:{label_text}, topk_text:{topk_text}, batch_idx:{batch_idx}")
+
+    def validation_step(self, batch, batch_idx):
+        outputs = self.run_model_from_batch(batch, batch_idx, test=True)
+        # labels = batch['labels']
+        if self.args.mode == 'predict_img_label':
+            return
+        logits = outputs[0]
+        labels = outputs[1]
+        cands = outputs[2]  # when args.test_with_cand==True
+        if cands is not None:
+            cands = [int(cand) for cand in cands]
+        _, idx = torch.sort(logits, dim=-1, descending=True)
+        assert len(labels) == 1
+        # print(cands, idx)
+        if cands is not None:
+            return_preds = torch.tensor(cands)[idx.squeeze(0)].tolist()
+        else:
+            return_preds = torch.arange(idx.size(1))[idx.squeeze(0)].tolist()
+        # print(return_preds)
+        return_labels = labels.item()
+
+        self.log_res(batch, idx, batch_idx=batch_idx, k=11)
+
+        if cands:
+            # logger.debug(cands, labels)
+            # R10 下 logits 的索引空间是“cand 内部索引”，
+            # 所以需要把真实贴纸 id 映射到 cand 中对应位置后再算命中率/MRR。
+            for i, cand in enumerate(cands):
+                if int(cand) == labels.item():
+                    labels[0] = i
+                    # logger.debug(f'label after mapping:{i}')
+                    break
+
+        topks = [1, 2, 5] if not self.args.test_with_cand else [1, 2, 5]
+        # self.valtest_acc5.update(*self.compute_acc(idx, labels, topks[0]))
+        # self.valtest_acc30.update(*self.compute_acc(idx, labels, topks[1]))
+        # self.valtest_acc90.update(*self.compute_acc(idx, labels, topks[2]))
+        # self.valtest_map.update(*self.compute_map(idx, labels))
+        cor1, tot1 = self.compute_acc(idx, labels, topks[0])
+        cor2, tot2 = self.compute_acc(idx, labels, topks[1])
+        cor5, tot5 = self.compute_acc(idx, labels, topks[2])
+        cor, tot = self.compute_map(idx, labels)
+        self.valtest_acc5.update(cor1, tot1)
+        self.valtest_acc30.update(cor2, tot2)
+        self.valtest_acc90.update(cor5, tot5)
+        self.valtest_map.update(cor, tot)
+        return [(cor1 / tot1).item(), (cor2 / tot2).item(), (cor5 / tot5).item(), (cor / tot).item()], return_preds, return_labels
+
+    def on_validation_epoch_end(self) -> None:
+        if self.args.mode == 'predict_img_label':
+            logger.debug(self.model.predict_id2ocr)
+            logger.debug(len(self.model.predict_id2ocr))
+            with open('./data/ocr_predict.json', 'w', encoding='utf-8') as f:
+                json.dump(self.model.predict_id2ocr, f,
+                          indent=2, ensure_ascii=False)
+            return
+        eval_mode = "R10(candidates)" if self.args.test_with_cand else "Rall(all-stickers)"
+        logger.info(
+            f"\n[EvalSummary] epoch={self.current_epoch} mode={eval_mode} total={self.valtest_acc5.total} "
+            f"r@1={self.valtest_acc5.compute():.4f} r@2={self.valtest_acc30.compute():.4f} "
+            f"r@5={self.valtest_acc90.compute():.4f} mrr={self.valtest_map.compute():.4f}"
+        )
+        self.valtest_acc5.reset()
+        self.valtest_acc30.reset()
+        self.valtest_acc90.reset()
+        self.valtest_map.reset()
+        return super().on_validation_epoch_end()
+
+    def on_test_epoch_start(self) -> None:
+        self.model.prepare_for_test()
+        return super().on_test_epoch_start()
+
+    def test_step(self, batch, batch_idx):
+        return self.validation_step(batch, batch_idx)
+
+    def test_epoch_end(self, outputs):
+        self.on_validation_epoch_end()
+        if len(outputs) == 0:
+            logger.warning("[TestSummary] empty outputs in test_epoch_end")
+            return
+
+        cols = ['r@1', 'r@2', 'r@5', 'mrr']
+        res = {col: [] for col in cols}
+        pred_res = []
+        for item in outputs:
+            metrics, pred, answer = item
+            pred_res.append({'pred': pred, 'answer': answer})
+            for i, val in enumerate(metrics):
+                res[cols[i]].append(val)
+
+        def get_filename_withoutext(path):
+            filename_withext = os.path.basename(path)
+            name, ext = os.path.splitext(filename_withext)
+            return name
+
+        outpath = f'result/{get_filename_withoutext(self.args.test_data_path)}_{self.args.test_with_cand}.json'
+        with open(outpath, 'w') as f:
+            json.dump(res, f, ensure_ascii=False, indent=2)
+
+        pred_outpath = f'result/{get_filename_withoutext(self.args.test_data_path)}_{self.args.test_with_cand}_pred.json'
+        with open(pred_outpath, 'w') as f:
+            json.dump(pred_res, f, ensure_ascii=False, indent=2)
+
+        # 测试结束时只打印摘要信息，避免把大数组直接打满终端。
+        sample = pred_res[0] if pred_res else {}
+        sample_pred = sample.get('pred', [])[:10]
+        sample_answer = sample.get('answer', None)
+        logger.info(
+            f"[TestSummary] samples={len(outputs)} metrics_file={outpath} pred_file={pred_outpath}"
+        )
+        logger.info(
+            f"[TestPreview] answer={sample_answer} top10_pred={sample_pred}"
+        )
+
+    @property
+    def num_training_steps(self) -> int:
+        """返回训练总 step 数（给 step-based scheduler 使用）。"""
+        if self.trainer.max_steps:
+            return self.trainer.max_steps
+
+        # 优先使用 Lightning 内置估计，避免 DDP / grad accumulation 下手算偏差。
+        estimated_steps = getattr(self.trainer, "estimated_stepping_batches", None)
+        if estimated_steps is not None and estimated_steps > 0:
+            return int(estimated_steps)
+
+        limit_batches = self.trainer.limit_train_batches
+        batches = len(self.train_dataloader())
+        batches = min(batches, limit_batches) if isinstance(
+            limit_batches, int) else int(limit_batches * batches)
+
+        num_devices = max(1, self.trainer.num_gpus, self.trainer.num_processes)
+        if self.trainer.tpu_cores:
+            num_devices = max(num_devices, self.trainer.tpu_cores)
+
+        effective_accum = self.trainer.accumulate_grad_batches * num_devices
+        return (batches // effective_accum) * self.trainer.max_epochs
+
+    def configure_optimizers(self):
+        logger.info(
+            f"img lr:{self.args.img_lr}, fix text:{self.args.fix_text}, fix img:{self.args.fix_img}")
+        assert self.args.model_choice == 'use_img_clip'
+        img_params = [var for name, var in self.model.named_parameters(
+        ) if name.startswith('img_clip') and var.requires_grad]
+        other_params = [var for name, var in self.model.named_parameters() if
+                        (not name.startswith('text_clip')) and (not name.startswith('img_clip')) and var.requires_grad]
+        logger.info(
+            f"len img params:{len(img_params)}, len total params:{len(list(self.model.parameters()))}")
+        optimizer = AdamW([{'params': img_params, 'lr': self.args.img_lr}, {
+                          'params': other_params}], lr=self.args.other_lr, betas=(0.9, 0.98), weight_decay=0.2)
+        # 这个 cosine scheduler 是“按 step 设计”的，必须每个 optimizer step 更新一次；
+        # 如果按 epoch 更新，会出现学习率节奏错位，甚至导致相邻 ckpt 权重重复。
+        total_steps = max(1, self.num_training_steps)
+        num_warmup_steps = 0
+        scheduler = transformers.get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps, total_steps)
+        logger.info(f"use scheduler! total_steps={total_steps}, warmup_steps={num_warmup_steps}")
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'step',
+                'frequency': 1,
+            }
+        }
+        # return AdamW(filter(lambda p: p.requires_grad, self.model.parameters()), lr=self.lr)
+        # return torch.optim.SGD(self.model.parameters(), lr=0.5, momentum=0.9)
+        # return AdamW(self.model.parameters(), lr=self.lr)
+
+
+def test_emotion_prediction(args):
+    print('test emotion prediction!')
+    model = PLModel(args)
+    ckpt = torch.load(args.ckpt_path, map_location="cpu")
+    # print(ckpt.keys())
+    model.load_state_dict(ckpt['state_dict'])
+    device = torch.device('cuda')
+    model.eval().to(device)
+    pld = PLDataLoader(args, model.model.bert_tokenizer)
+    pld.setup('test')
+    dataset = pld.test_dataset
+    batch_idx = 0
+    scores = []
+
+    for i in tqdm(range(len(dataset))):
+        data = dataset[i]
+        # print(data)
+        if data['emotion_id'] == -100:
+            continue
+
+        batch = pld.collate_fn([data])
+        # print(batch)
+        user_ids = batch.get('user_ids', None)
+        batch = batch_to_device(batch, device)
+        if user_ids is not None:
+            batch['user_ids'] = user_ids
+        outputs = model.run_model_from_batch(batch, batch_idx, )
+        # print(data['emotion_id'], outputs)
+        scores.append(float(data['emotion_id'] == outputs.item()))
+        batch_idx += 1
+        # break
+
+    print(f'valid samples:{len(scores)}, mean accuracy for predicting emotion:{np.mean(scores)}')
+
+
+def test_sentence_gradient(args):
+    print('test sentence gradient!')
+    model = PLModel(args)
+    ckpt = torch.load(args.ckpt_path, map_location="cpu")
+    # print(ckpt.keys())
+    model.load_state_dict(ckpt['state_dict'])
+    device = torch.device('cuda')
+    model.eval().to(device)
+    pld = PLDataLoader(args, model.model.bert_tokenizer)
+    pld.setup('test')
+    dataset = pld.test_dataset
+    batch_idx = 0
+    scores = []
+
+    tokenizer = model.model.bert_tokenizer
+
+    res = []
+
+    for i in tqdm(range(len(dataset))):
+        data = dataset[i]
+        # print(data)
+        # if data['emotion_id'] == -100:
+        #     continue
+
+        batch = pld.collate_fn([data])
+        # print(batch)
+        user_ids = batch.get('user_ids', None)
+        batch = batch_to_device(batch, device)
+        if user_ids is not None:
+            batch['user_ids'] = user_ids
+        outputs = model.run_model_from_batch(batch, batch_idx, ) # grad
+        grad, success = outputs
+        print(f'success:{success}')
+        # if not success:
+        #     continue
+        # print(f'grad:{outputs.size()}')
+        input_ids = batch['input_ids'].squeeze(0).tolist()
+        # print(input_ids)
+        tokens = tokenizer.convert_ids_to_tokens(input_ids)
+        print(tokens)
+        d = {}
+        d['tokens'] = ''.join(tokens)
+        grad_norm = torch.norm(grad.squeeze(0), 2, dim=-1)
+        d['token_scores'] = []
+        # print(grad_norm.size())
+        for j, token in enumerate(tokens):
+            print(token, grad_norm[j].item())
+            d['token_scores'].append([token, grad_norm[j].item()])
+        res.append(d)
+        # print(data['emotion_id'], outputs)
+        # scores.append(float(data['emotion_id'] == outputs.item()))
+        batch_idx += 1
+    
+        # break
+    with open('./log_gradient_test_easy.json', 'w') as f:
+        json.dump(res, f, ensure_ascii=False, indent=2)
+
+    print(f'valid samples:{len(scores)}, mean accuracy for predicting emotion:{np.mean(scores)}')
+
+@dataclass
+class Arguments:
+    train_data_path: Optional[str] = field(default='./data/train_pair.json')
+    val_data_path: Optional[str] = field(default='./data/validation_pair.json')
+    test_data_path: Optional[str] = field(
+        default='./data/validation_pair.json')
+    gen_data_path: Optional[str] = field(default='./data/validation_gen.json')
+    gen_out_data_path: Optional[str] = field(
+        default='./data/validation_gen_out.json')
+    img_lr: Optional[float] = field(default=5e-7)
+    other_lr: Optional[float] = field(default=1e-5)
+    gpus: Optional[int] = field(default=1)
+    seed: Optional[int] = field(default=2021)
+    epochs: Optional[int] = field(default=10)
+    train_batch_size: Optional[int] = field(default=8)
+    valtest_batch_size: Optional[int] = field(default=1)
+    gen_batch_size: Optional[int] = field(default=1)
+    gradient_accumulation_steps: Optional[int] = field(default=1)
+    mode: Optional[str] = field(default='train')
+    ckpt_path: Optional[str] = field(
+        default='')
+    ckpt_epoch: Optional[int] = field(default=-1)
+
+    pretrain_path: Optional[str] = field(
+        default='./ckpt/chinese-roberta-wwm-ext')
+    bert_pretrain_path: Optional[str] = field(
+        default='./ckpt/bert-base-chinese')
+    img_pretrain_path: Optional[str] = field(
+        default='./ckpt/clip-ViT-B-32')
+    text_clip_pretrain_path: Optional[str] = field(
+        default='./ckpt/clip-ViT-B-32-multilingual-v1')
+    clip_download_root: Optional[str] = field(default='./ckpt')
+    local_files_only: Optional[bool] = field(default=True)
+    pl_root_dir: Optional[str] = field(default='logs/clip')
+    id2img_path: Optional[str] = field(default='./data/id2img.json')
+    img_dir: Optional[str] = field(default='./data/meme_set')
+    fix_text: Optional[bool] = field(default=False)
+    fix_img: Optional[bool] = field(default=False)
+    model_choice: Optional[str] = field(default='use_img_clip')
+    max_image_id: Optional[int] = field(default=307)
+    max_emotion_id: Optional[int] = field(default=52)
+    init_temp: Optional[float] = field(default=np.log(1/0.07))
+    sent_num: Optional[int] = field(default=1)
+    num_workers: Optional[int] = field(default=32)
+    test_with_cand: Optional[bool] = field(default=False)
+    use_visual_personalization_token: Optional[bool] = field(default=False)
+    use_visual_history_attention: Optional[bool] = field(default=True)
+    visual_history_max_len: Optional[int] = field(default=50)
+    visual_personalization_hidden_dim: Optional[int] = field(default=256)
+    loo_filter_in_test: Optional[bool] = field(default=False)
+    user_history_cache_path: Optional[str] = field(default='./data/user_history_cache.json')
+    add_emotion_task: Optional[bool] = field(default=False)
+    add_predict_context_task: Optional[bool] = field(default=False)
+    add_predict_img_label_task: Optional[bool] = field(default=False)
+    add_ocr_info: Optional[bool] = field(default=False)
+    max_img_label_mask_num: Optional[int] = field(default=11, metadata={
+                                                  'help': 'img label length plus one position for cls(start) token'})
+    ocr_path: Optional[str] = field(default='./data/ocr_max10.json')
+    emotion_weight: Optional[float] = field(default=0.1)
+    ctx_weight: Optional[float] = field(default=0.05)
+    label_weight: Optional[float] = field(default=0.1)
+
+    def __post_init__(self):
+        # if self.add_predict_img_label_task is True:
+        #     assert self.add_ocr_info is True
+        if self.ckpt_path and os.path.exists(self.ckpt_path):
+            names = os.listdir(self.ckpt_path)
+            if len(names) == 1:
+                self.ckpt_path = os.path.join(self.ckpt_path, names[0])
+            elif len(names) > 1:
+                # 支持“目录 + epoch”方式选 ckpt：
+                # --ckpt_path 指向目录，--ckpt_epoch 指定 epoch=N 的文件。
+                # 这样测试命令更稳定，避免手工拼完整文件名。
+                if(self.ckpt_epoch == -1):
+                    raise Exception(
+                        "More than 1 checkpoint but ckpt_epoch is -1")
+                for name in names:
+                    if f'epoch={self.ckpt_epoch}-' in name:
+                        self.ckpt_path = os.path.join(self.ckpt_path, name)
+                        break
+            else:
+                raise Exception(f'No checkpoints in {self.ckpt_path}')
+
+            logger.info(f'real ckpt_path:{self.ckpt_path}')
+
+
+def main(args):
+    if args.local_files_only:
+        # 离线模式：严格禁止 HF 在线下载，确保只使用本地 ckpt。
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+    pl.seed_everything(args.seed)
+    if args.mode == 'train' or args.mode == 'pretrain':
+        model = PLModel(args)
+        if args.ckpt_path:
+            logger.info(f'load from {args.ckpt_path}')
+            ckpt = torch.load(args.ckpt_path, map_location="cpu")
+            model.load_state_dict(ckpt['state_dict'])
+        if args.model_choice == 'use_clip_repo':
+            pld = PLDataLoader(args)
+        else:
+            pld = PLDataLoader(args, model.model.bert_tokenizer)
+        checkpoint_callback = ModelCheckpoint(save_top_k=-1,
+                                              verbose=True)
+        # earlystop_callback = EarlyStopping(monitor='val_loss',
+        #                                    verbose=True,
+        #                                    mode='min')
+        trainer = pl.Trainer(
+            gpus=args.gpus,
+            callbacks=[checkpoint_callback],
+            accelerator='ddp',
+            # num_sanity_val_steps=0,
+            # limit_train_batches=16,
+            # limit_val_batches=0.01,
+            # gradient_clip_val=1.0,
+            max_epochs=args.epochs,
+            accumulate_grad_batches=args.gradient_accumulation_steps,
+            default_root_dir=args.pl_root_dir)
+        attach_version_log_from_trainer(args, trainer)
+        trainer.fit(model, pld)
+    elif args.mode == 'test' or args.mode == 'gen':
+        model = PLModel(args)
+        ckpt = torch.load(args.ckpt_path, map_location="cpu")
+        # print(ckpt.keys())
+        model.load_state_dict(ckpt['state_dict'])
+        pld = PLDataLoader(args, model.model.bert_tokenizer)
+        trainer = pl.Trainer(gpus=args.gpus,
+                             max_epochs=args.epochs,
+                             default_root_dir=args.pl_root_dir)
+        attach_version_log_from_trainer(args, trainer)
+        trainer.test(model, datamodule=pld)
+
+    elif args.mode == 'predict_img_label':
+        model = PLModel(args)
+        ckpt = torch.load(args.ckpt_path, map_location="cpu")
+        # print(ckpt.keys())
+        model.load_state_dict(ckpt['state_dict'], strict=False)
+        pld = PLDataLoader(args, model.model.bert_tokenizer)
+
+        trainer = pl.Trainer(gpus=args.gpus,
+                             max_epochs=args.epochs,
+                             default_root_dir=args.pl_root_dir)
+        attach_version_log_from_trainer(args, trainer)
+        trainer.test(model, datamodule=pld)
+
+    elif args.mode == 'predict_emotion':
+        attach_manual_log_file(args)
+        test_emotion_prediction(args)
+
+    elif args.mode == 'test_gradient':
+        attach_manual_log_file(args)
+        test_sentence_gradient(args)
+
+
+if __name__ == '__main__':
+    try_create_dir('./logs')
+    parser = HfArgumentParser(Arguments)
+    args, = parser.parse_args_into_dataclasses()
+    main(args)
