@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import base64
 import datetime
 import io
 import json
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib import error, request
 from PIL import Image
+
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
 
 
 DEFAULT_PROMPT = """You are helping build weak supervision for a conversational sticker retrieval dataset.
@@ -123,6 +132,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=True,
         help="Convert GIF input to first-frame PNG before upload (recommended for Gemini routes).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=50,
+        help="Concurrent requests (default: 50). With aiohttp, 50-200 is typical; avoid >500 to prevent TCP issues.",
+    )
+    parser.add_argument(
+        "--no-async",
+        action="store_true",
+        help="Use sync ThreadPoolExecutor instead of aiohttp (slower).",
     )
     return parser.parse_args()
 
@@ -300,6 +320,40 @@ def chat_completion(
     return message, response_json
 
 
+async def chat_completion_async(
+    session: "aiohttp.ClientSession",
+    endpoint: str,
+    api_key: str,
+    payload: Dict,
+    timeout: int,
+) -> Tuple[str, Dict]:
+    """Async version using aiohttp. More efficient for high concurrency."""
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    timeout_ctx = aiohttp.ClientTimeout(total=timeout)
+    async with session.post(endpoint, json=payload, headers=headers, timeout=timeout_ctx) as resp:
+        raw = await resp.text()
+        if resp.status != 200:
+            err_msg = f"HTTP {resp.status}: {raw[:500]}"
+            if resp.status in (429, 503, 502):
+                raise ConnectionError(err_msg)  # retryable
+            raise ValueError(err_msg)
+    response_json = json.loads(raw)
+    choice = response_json.get("choices", [{}])[0]
+    message = choice.get("message", {}).get("content", "")
+    if isinstance(message, list):
+        parts = [item.get("text", "") for item in message if isinstance(item, dict)]
+        message = "\n".join(parts).strip()
+    if not isinstance(message, str) or not message.strip():
+        finish_reason = choice.get("finish_reason", "")
+        if finish_reason == "length":
+            raise ValueError("Invalid model content: empty with finish_reason=length. Try --max-tokens.")
+        raise ValueError(f"Invalid model content: {response_json}")
+    return message, response_json
+
+
 def classify_http_error(exc: error.HTTPError) -> Tuple[bool, str]:
     details = ""
     try:
@@ -320,6 +374,134 @@ def classify_http_error(exc: error.HTTPError) -> Tuple[bool, str]:
 
 def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _process_one_image(
+    image_path: Path,
+    filename: str,
+    image_id: str,
+    endpoint: str,
+    api_key: str,
+    prompt: str,
+    model: str,
+    convert_gif_first_frame: bool,
+    temperature: float,
+    max_tokens: int,
+    retries: int,
+    retry_sleep: float,
+    timeout: int,
+) -> Tuple[bool, Optional[Dict], str]:
+    """
+    Process a single image. Returns (ok, record_or_err, error_msg).
+    record: {"id", "filename", "label", "model"} on success; {"id", "filename", "error"} on failure.
+    """
+    try:
+        b64, mime = encode_image_for_api(
+            image_path=image_path,
+            convert_gif_first_frame=convert_gif_first_frame,
+        )
+        data_url = f"data:{mime};base64,{b64}"
+        payload = build_payload(
+            model=model,
+            prompt=prompt,
+            data_url=data_url,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    except Exception as e:
+        return False, {"id": image_id, "filename": filename, "error": str(e)}, str(e)
+
+    last_error = ""
+    for attempt in range(1, retries + 1):
+        try:
+            content, _ = chat_completion(
+                endpoint=endpoint,
+                api_key=api_key,
+                payload=payload,
+                timeout=timeout,
+            )
+            label = validate_label(extract_first_json(content))
+            record = {
+                "id": image_id,
+                "filename": filename,
+                "label": label,
+                "model": model,
+            }
+            return True, record, ""
+        except (ValueError, json.JSONDecodeError, error.HTTPError, error.URLError) as exc:
+            last_error = str(exc)
+            retryable = True
+            if isinstance(exc, error.HTTPError):
+                retryable, _ = classify_http_error(exc)
+            if not retryable or attempt >= retries:
+                break
+            if attempt < retries:
+                time.sleep(retry_sleep * attempt)
+
+    err_record = {"id": image_id, "filename": filename, "error": last_error}
+    return False, err_record, last_error
+
+
+async def _process_one_image_async(
+    session: "aiohttp.ClientSession",
+    semaphore: asyncio.Semaphore,
+    task: Tuple,
+    endpoint: str,
+    api_key: str,
+    prompt: str,
+    model: str,
+    convert_gif_first_frame: bool,
+    temperature: float,
+    max_tokens: int,
+    retries: int,
+    retry_sleep: float,
+    timeout: int,
+) -> Tuple[bool, Optional[Dict], str]:
+    """Async process with semaphore to limit concurrency. Returns (ok, record, err_msg)."""
+    image_path, filename, image_id = task
+    async with semaphore:
+        try:
+            b64, mime = encode_image_for_api(
+                image_path=image_path,
+                convert_gif_first_frame=convert_gif_first_frame,
+            )
+            data_url = f"data:{mime};base64,{b64}"
+            payload = build_payload(
+                model=model,
+                prompt=prompt,
+                data_url=data_url,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            return False, {"id": image_id, "filename": filename, "error": str(e)}, str(e)
+
+        last_error = ""
+        for attempt in range(1, retries + 1):
+            try:
+                content, _ = await chat_completion_async(
+                    session=session,
+                    endpoint=endpoint,
+                    api_key=api_key,
+                    payload=payload,
+                    timeout=timeout,
+                )
+                label = validate_label(extract_first_json(content))
+                record = {"id": image_id, "filename": filename, "label": label, "model": model}
+                return True, record, ""
+            except (ValueError, json.JSONDecodeError, ConnectionError, asyncio.TimeoutError) as exc:
+                last_error = str(exc)
+                if attempt >= retries:
+                    break
+                await asyncio.sleep(retry_sleep * attempt)
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt >= retries:
+                    break
+                await asyncio.sleep(retry_sleep * attempt)
+
+        err_record = {"id": image_id, "filename": filename, "error": last_error}
+        return False, err_record, last_error
 
 
 def sanitize_model_for_filename(model_name: str) -> str:
@@ -384,92 +566,113 @@ def main() -> None:
 
     endpoint = f"{args.base_url.rstrip('/')}/{args.api_path.lstrip('/')}"
 
-    total = len(images)
+    tasks = []
+    for image_path in images:
+        filename = image_path.name
+        image_id = img2id.get(filename, image_path.stem)
+        if not args.overwrite and image_id in processed_ids:
+            continue
+        tasks.append((image_path, filename, image_id))
+
+    skipped = len(images) - len(tasks)
+    total = len(tasks)
     success = 0
-    skipped = 0
     failed = 0
+    workers = max(1, getattr(args, "workers", 50))
+    write_lock = threading.Lock()
 
-    with output_path.open(output_mode, encoding="utf-8") as out_f, errors_path.open(
-        errors_mode, encoding="utf-8"
-    ) as err_f:
-        for idx, image_path in enumerate(images, start=1):
-            filename = image_path.name
-            image_id = img2id.get(filename, image_path.stem)
+    use_async = HAS_AIOHTTP and not args.no_async
+    print(f"[pseudo_label] {total} images to process, {workers} workers, skipped={skipped}, backend={'aiohttp' if use_async else 'sync'}")
 
-            if not args.overwrite and image_id in processed_ids:
-                skipped += 1
-                print(f"[{idx}/{total}] skip id={image_id} file={filename}")
-                continue
+    if use_async:
 
-            print(f"[{idx}/{total}] processing id={image_id} file={filename}")
-            b64, mime = encode_image_for_api(
-                image_path=image_path,
-                convert_gif_first_frame=args.convert_gif_first_frame,
-            )
-            data_url = f"data:{mime};base64,{b64}"
-            payload = build_payload(
-                model=args.model,
-                prompt=prompt,
-                data_url=data_url,
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
-            )
-
-            ok = False
-            last_error = ""
-            for attempt in range(1, args.retries + 1):
-                try:
-                    content, _ = chat_completion(
+        async def run_async():
+            nonlocal success, failed
+            semaphore = asyncio.Semaphore(workers)
+            connector = aiohttp.TCPConnector(limit=min(workers * 2, 500), limit_per_host=workers)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                coros = [
+                    _process_one_image_async(
+                        session=session,
+                        semaphore=semaphore,
+                        task=t,
                         endpoint=endpoint,
                         api_key=args.api_key,
-                        payload=payload,
+                        prompt=prompt,
+                        model=args.model,
+                        convert_gif_first_frame=args.convert_gif_first_frame,
+                        temperature=args.temperature,
+                        max_tokens=args.max_tokens,
+                        retries=args.retries,
+                        retry_sleep=args.retry_sleep,
                         timeout=args.timeout,
                     )
-                    label = validate_label(extract_first_json(content))
-                    record = {
-                        "id": image_id,
-                        "filename": filename,
-                        "label": label,
-                        "model": args.model,
-                    }
-                    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    out_f.flush()
-                    success += 1
-                    ok = True
-                    break
-                except (ValueError, json.JSONDecodeError, error.HTTPError, error.URLError) as exc:
-                    last_error = str(exc)
-                    retryable = True
-                    http_details = ""
-                    if isinstance(exc, error.HTTPError):
-                        retryable, http_details = classify_http_error(exc)
-                        if http_details:
-                            last_error = f"{last_error} | {http_details}"
-                    print(
-                        f"  attempt {attempt}/{args.retries} failed: {last_error}",
-                        flush=True,
-                    )
-                    if http_details:
-                        print(f"  http_error_body: {http_details}", flush=True)
-                    if (not retryable) or attempt >= args.retries:
-                        break
-                    if attempt < args.retries:
-                        time.sleep(args.retry_sleep * attempt)
+                    for t in tasks
+                ]
+                with output_path.open(output_mode, encoding="utf-8") as out_f, errors_path.open(
+                    errors_mode, encoding="utf-8"
+                ) as err_f:
+                    done = 0
+                    for coro in asyncio.as_completed(coros):
+                        ok, record, _ = await coro
+                        with write_lock:
+                            if ok and record:
+                                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                                out_f.flush()
+                                success += 1
+                            else:
+                                err_f.write(json.dumps(record or {}, ensure_ascii=False) + "\n")
+                                err_f.flush()
+                                failed += 1
+                        done += 1
+                        if done % 50 == 0 or done == total:
+                            print(f"[pseudo_label] progress {done}/{total} done, success={success}, failed={failed}")
 
-            if not ok:
-                failed += 1
-                err_record = {
-                    "id": image_id,
-                    "filename": filename,
-                    "error": last_error,
-                }
-                err_f.write(json.dumps(err_record, ensure_ascii=False) + "\n")
-                err_f.flush()
+        asyncio.run(run_async())
+    else:
+        def do_one(task):
+            image_path, filename, image_id = task
+            return _process_one_image(
+                image_path=image_path,
+                filename=filename,
+                image_id=image_id,
+                endpoint=endpoint,
+                api_key=args.api_key,
+                prompt=prompt,
+                model=args.model,
+                convert_gif_first_frame=args.convert_gif_first_frame,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                retries=args.retries,
+                retry_sleep=args.retry_sleep,
+                timeout=args.timeout,
+            )
+
+        with output_path.open(output_mode, encoding="utf-8") as out_f, errors_path.open(
+            errors_mode, encoding="utf-8"
+        ) as err_f:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {ex.submit(do_one, t): t for t in tasks}
+                done = 0
+                for fut in as_completed(futures):
+                    ok, record, err_msg = fut.result()
+                    with write_lock:
+                        if ok and record:
+                            out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            out_f.flush()
+                            success += 1
+                        else:
+                            err_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            err_f.flush()
+                            failed += 1
+                    done += 1
+                    if done % 50 == 0 or done == total:
+                        print(f"[pseudo_label] progress {done}/{total} done, success={success}, failed={failed}")
 
     print("=" * 72)
     print(f"endpoint: {endpoint}")
-    print(f"model: {args.model}")
-    print(f"total: {total}, success: {success}, skipped: {skipped}, failed: {failed}")
+    print(f"model: {args.model}, workers: {workers}")
+    print(f"processed: {total}, success: {success}, skipped: {skipped}, failed: {failed}")
     print(f"output: {output_path}")
     print(f"errors: {errors_path}")
 

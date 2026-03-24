@@ -1,4 +1,5 @@
 import os
+import random
 # Work around protobuf C-extension segfault on some environments.
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 import time
@@ -18,6 +19,7 @@ from typing import Optional
 from dataclasses import dataclass, field
 import numpy as np
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 import hashlib
 from transformers.utils.dummy_pt_objects import LogitsProcessor
@@ -199,6 +201,15 @@ def _extract_speaker_from_text(text):
     if text.startswith('[speaker2]'):
         return '[speaker2]'
     return 'unknown_speaker'
+
+
+def _build_speaker_special_tokens(max_speaker_id):
+    """
+    构建 speaker 特殊 token 列表：['[speaker1]', ..., f'[speaker{N}]']。
+    """
+    n = int(max_speaker_id) if max_speaker_id is not None else 2
+    n = max(2, n)
+    return [f"[speaker{i}]" for i in range(1, n + 1)]
 
 
 def _resolve_user_key(sample, dialog, fallback_index):
@@ -513,7 +524,9 @@ class Model(torch.nn.Module):
         self.visual_feat_dim = 512
         self.bert_hidden_dim = self.bert.config.hidden_size
         special_tokens_dict = {
-            'additional_special_tokens': ['[speaker1]', '[speaker2]']
+            'additional_special_tokens': _build_speaker_special_tokens(
+                self.args.speaker_token_max_id
+            )
         }
         self.bert_tokenizer.add_special_tokens(special_tokens_dict)
         self.bert.resize_token_embeddings(len(self.bert_tokenizer))
@@ -569,7 +582,8 @@ class Model(torch.nn.Module):
             self.id2ocr[int(k)] = v['ocr']
 
         self.id2name = {}
-        with open('./data/id2name.json', encoding='utf-8') as f:
+        id2name_path = getattr(self.args, 'id2name_path', './data/id2name.json')
+        with open(id2name_path, encoding='utf-8') as f:
             a = json.load(f)
             for k, v in a.items():
                 self.id2name[int(k)] = v
@@ -1005,7 +1019,7 @@ class Model(torch.nn.Module):
         with torch.no_grad():
             if self.args.model_choice == 'use_clip_repo':
                 img_objs = []
-                for id in range(self.args.max_image_id):
+                for id in tqdm(range(self.args.max_image_id), desc="load_imgs"):
                     img_obj = self.id2img[id]
                     img_objs.append(img_obj)
                 device = next(self.clip_model.parameters()).device
@@ -1019,17 +1033,46 @@ class Model(torch.nn.Module):
                     img_ids, dtype=torch.long, device=self.text_clip.device))
 
             else:
-                img_objs = []
-                for id in range(self.args.max_image_id):
-                    img_obj = self.get_image_obj(id)
-                    img_objs.append(img_obj)
-                img_tokens = self.img_clip.tokenize(img_objs)
+                cache_path = (self.args.img_emb_cache_path or '').strip()
+                if cache_path and os.path.exists(cache_path):
+                    logger.info(f"Loading precomputed embeddings from {cache_path}")
+                    self.all_img_embs = torch.load(cache_path, map_location='cpu')
+                    device = self.img_clip._target_device
+                    self.all_img_embs = self.all_img_embs.to(device)
+                    assert self.all_img_embs.size(0) == self.args.max_image_id, \
+                        f"Cache shape {self.all_img_embs.shape} vs max_image_id {self.args.max_image_id}"
+                else:
+                    # Batched encoding with parallel image loading for higher GPU utilization
+                    batch_size = self.args.prepare_batch_size
+                    workers = self.args.prepare_workers
+                    device = self.img_clip._target_device
+                    self.img_clip.eval()
+                    all_embs = []
 
-                img_tokens = batch_to_device(
-                    img_tokens, self.img_clip._target_device)
-                self.img_clip.eval()
-                self.all_img_embs = self.img_clip.forward(
-                    img_tokens)['sentence_embedding']
+                    def load_one(id):
+                        return id, self.get_image_obj(id)
+
+                    for start in tqdm(range(0, self.args.max_image_id, batch_size),
+                                     desc="encode_all_stickers"):
+                        end = min(start + batch_size, self.args.max_image_id)
+                        ids_batch = list(range(start, end))
+                        img_objs = [None] * len(ids_batch)
+                        with ThreadPoolExecutor(max_workers=workers) as ex:
+                            futures = {ex.submit(load_one, i): i for i in ids_batch}
+                            for f in as_completed(futures):
+                                idx, obj = f.result()
+                                img_objs[idx - start] = obj
+                        img_tokens = self.img_clip.tokenize(img_objs)
+                        img_tokens = batch_to_device(img_tokens, device)
+                        embs = self.img_clip.forward(img_tokens)['sentence_embedding']
+                        all_embs.append(embs)
+                    self.all_img_embs = torch.cat(all_embs, dim=0)
+                    if cache_path:
+                        d = os.path.dirname(cache_path)
+                        if d:
+                            os.makedirs(d, exist_ok=True)
+                        torch.save(self.all_img_embs.cpu(), cache_path)
+                        logger.info(f"Saved embeddings to {cache_path}")
 
     def get_emb_by_imgids(self, img_ids):
         """
@@ -1041,6 +1084,12 @@ class Model(torch.nn.Module):
         输出：
         - Tensor[B, D]: 贴纸视觉向量。
         """
+        # fix_img 且已有预计算 embedding 时，直接查表，避免训练时重复加载图像
+        if (self.args.fix_img and hasattr(self, 'all_img_embs') and
+                self.all_img_embs is not None):
+            device = self.img_clip._target_device
+            ids_t = torch.tensor(img_ids, dtype=torch.long, device=device)
+            return self.all_img_embs[ids_t]
         img_objs = []
         for i, id in enumerate(img_ids):
             img_obj = self.get_image_obj(id)
@@ -2019,8 +2068,18 @@ class PLDataset(Dataset):
             mask_context_attention_mask = None
 
         if self.args.test_with_cand:
-            cand = [id for id in sample['cand']]
-
+            cand = sample.get('cand')
+            if cand is not None:
+                cand = [int(id) for id in cand]
+            elif img_id is not None and neg_img_id is not None:
+                # Build R10 on-the-fly: 1 pos + 9 neg (incl. provided neg_img_id)
+                exclude = {int(img_id), int(neg_img_id)}
+                pool = [i for i in range(self.args.max_image_id) if i not in exclude]
+                n_extra = min(8, len(pool))
+                extra = random.sample(pool, n_extra) if n_extra > 0 else []
+                cand = [int(img_id), int(neg_img_id)] + extra
+            else:
+                cand = None
         else:
             cand = None
         user_id = _resolve_user_key(sample, dialog, index)
@@ -2104,6 +2163,9 @@ class PLDataLoader(pl.LightningDataModule):
 
             self.train_dataset = PLDataset(self.train_data_path,
                                            self.args.mode, self.args, self.tokenizer)
+            n_train = len(self.train_dataset)
+            logger.info(f"train samples={n_train}, train_batch_size={self.train_batch_size}, "
+                        f"steps_per_epoch={max(1, (n_train + self.train_batch_size - 1) // self.train_batch_size)}")
             if self.args.val_data_path:
                 self.val_dataset = PLDataset(
                     self.val_data_path, self.args.mode, self.args, self.tokenizer)
@@ -2308,7 +2370,8 @@ class PLModel(pl.LightningModule):
         self.args = args
         self.model.prepare_imgs(args)
         self.id2name = {}
-        with open('./data/id2name.json', encoding='utf-8') as f:
+        id2name_path = getattr(args, 'id2name_path', './data/id2name.json')
+        with open(id2name_path, encoding='utf-8') as f:
             a = json.load(f)
             for k, v in a.items():
                 self.id2name[int(k)] = v
@@ -2941,6 +3004,7 @@ class Arguments:
     model_choice: Optional[str] = field(default='use_img_clip')
     max_image_id: Optional[int] = field(default=307)
     max_emotion_id: Optional[int] = field(default=52)
+    speaker_token_max_id: Optional[int] = field(default=2)
     init_temp: Optional[float] = field(default=np.log(1/0.07))
     sent_num: Optional[int] = field(default=1)
     num_workers: Optional[int] = field(default=32)
@@ -2959,9 +3023,16 @@ class Arguments:
     max_img_label_mask_num: Optional[int] = field(default=11, metadata={
                                                   'help': 'img label length plus one position for cls(start) token'})
     ocr_path: Optional[str] = field(default='./data/ocr_max10.json')
+    id2name_path: Optional[str] = field(default='./data/id2name.json')
     emotion_weight: Optional[float] = field(default=0.1)
     ctx_weight: Optional[float] = field(default=0.05)
     label_weight: Optional[float] = field(default=0.1)
+    prepare_batch_size: Optional[int] = field(
+        default=512, metadata={'help': 'batch size for prepare_for_test encoding'})
+    prepare_workers: Optional[int] = field(
+        default=8, metadata={'help': 'parallel workers for loading images in prepare_for_test'})
+    img_emb_cache_path: Optional[str] = field(
+        default='', metadata={'help': 'path to precomputed sticker CLIP embeddings .pt; if exists, load instead of compute'})
 
     def __post_init__(self):
         """
@@ -2999,6 +3070,13 @@ class Arguments:
                 raise Exception(f'No checkpoints in {self.ckpt_path}')
 
             logger.info(f'real ckpt_path:{self.ckpt_path}')
+        if self.speaker_token_max_id is None:
+            self.speaker_token_max_id = 2
+        if self.speaker_token_max_id < 2:
+            self.speaker_token_max_id = 2
+        # Auto-enable R10 when vocab is large (avoids scoring over 30k+ candidates)
+        if self.max_image_id and self.max_image_id > 1000:
+            self.test_with_cand = True
 
 
 def main(args):

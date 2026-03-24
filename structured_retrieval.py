@@ -268,6 +268,18 @@ class StructuredStickerModel(LegacyModel):
             ids = torch.tensor(list(img_ids), dtype=torch.long, device=device)
             return self.img_embedding_layer(ids)
 
+        # fix_img 且已有预计算 embedding 时，直接查表
+        if (
+            getattr(self.args, "fix_img", False)
+            and hasattr(self, "all_img_embs")
+            and self.all_img_embs is not None
+        ):
+            device = getattr(
+                self.img_clip, "_target_device", next(self.bert.parameters()).device
+            )
+            ids_t = torch.tensor(list(img_ids), dtype=torch.long, device=device)
+            return self.all_img_embs[ids_t]
+
         img_objs = [self.get_image_obj(int(img_id)) for img_id in img_ids]
         img_tokens = self.img_clip.tokenize(img_objs)
         if hasattr(self.img_clip, "model"):
@@ -301,6 +313,17 @@ class StructuredStickerModel(LegacyModel):
                 )
                 return
 
+            cache_path = (getattr(self.args, "img_emb_cache_path", None) or "").strip()
+            if cache_path and os.path.exists(cache_path):
+                logger.info(f"Loading precomputed embeddings from {cache_path}")
+                self.all_img_embs = torch.load(cache_path, map_location="cpu")
+                device = getattr(
+                    self.img_clip, "_target_device", next(self.bert.parameters()).device
+                )
+                self.all_img_embs = self.all_img_embs.to(device)
+                assert self.all_img_embs.size(0) == self.args.max_image_id
+                return
+
             img_objs = [self.get_image_obj(idx) for idx in range(self.args.max_image_id)]
             img_tokens = self.img_clip.tokenize(img_objs)
             if hasattr(self.img_clip, "model"):
@@ -315,6 +338,12 @@ class StructuredStickerModel(LegacyModel):
             }
             self.img_clip.eval()
             self.all_img_embs = self.img_clip.forward(img_tokens)["sentence_embedding"]
+            if cache_path:
+                d = os.path.dirname(cache_path)
+                if d:
+                    os.makedirs(d, exist_ok=True)
+                torch.save(self.all_img_embs.cpu(), cache_path)
+                logger.info(f"Saved embeddings to {cache_path}")
 
     def _get_text_word_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.bert.bert.embeddings.word_embeddings(input_ids)
