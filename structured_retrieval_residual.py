@@ -21,9 +21,11 @@ from structured_retrieval import (
     StructuredForwardOutput,
     StructuredPLModel,
     StructuredStickerModel,
+    _CAND_EVAL_ONLY_ERR,
     attach_per_epoch_dual_test_eval,
     build_trainer,
     load_checkpoint_to_model,
+    nonempty_batch_cands,
 )
 from structured_retrieval_tokens import (
     _config_mapping_to_argv,
@@ -292,10 +294,15 @@ class StructuredResidualStickerModel(StructuredStickerModel):
 
         q = self.encode_dialogue_query(input_ids, attention_mask)
 
-        if cands:
+        use_cands = nonempty_batch_cands(cands)
+        if use_cands:
             candidate_ids = [int(x) for x in cands[0]]
             candidate_h = self.all_img_embs[candidate_ids]
         else:
+            if getattr(self.args, "candidate_eval_only", False) or getattr(
+                self.args, "test_with_cand", False
+            ):
+                raise ValueError(_CAND_EVAL_ONLY_ERR)
             candidate_ids = list(range(self.args.max_image_id))
             candidate_h = self.all_img_embs
 
@@ -334,7 +341,7 @@ class StructuredResidualStickerModel(StructuredStickerModel):
         rank_scores = final_score.unsqueeze(0)
         labels = torch.tensor(img_ids, dtype=torch.long, device=device)
         if not return_debug:
-            return rank_scores, labels, candidate_ids if cands else None
+            return rank_scores, labels, candidate_ids if use_cands else None
 
         residual_stats = self.summarize_residual_stats()
         residual_delta = final_score - plain_base_score
@@ -371,7 +378,7 @@ class StructuredResidualStickerModel(StructuredStickerModel):
             if plain_logits is not None
             else None,
         }
-        return rank_scores, labels, candidate_ids if cands else None, eval_debug
+        return rank_scores, labels, candidate_ids if use_cands else None, eval_debug
 
 
 class StructuredResidualPLModel(StructuredPLModel):

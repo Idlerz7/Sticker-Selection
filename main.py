@@ -1946,8 +1946,20 @@ class Model(torch.nn.Module):
             segment_ids)
 
 
+def _expected_cand_size_from_path(path: Optional[str]) -> Optional[int]:
+    """Infer R10 vs R20 from filename (StickerChat *_with_cand_r10.json etc.)."""
+    if not path:
+        return None
+    p = str(path)
+    if "cand_r20" in p or ("_r20" in p and "cand" in p):
+        return 20
+    if "cand_r10" in p or ("_r10" in p and "cand" in p):
+        return 10
+    return None
+
+
 class PLDataset(Dataset):
-    def __init__(self, path, mode, args, tokenizer):
+    def __init__(self, path, mode, args, tokenizer, expected_cand_size: Optional[int] = None):
         """
         构造数据集对象，加载 JSON 并保存运行上下文。
 
@@ -1956,6 +1968,7 @@ class PLDataset(Dataset):
         - mode (str): 运行模式（train/test/gen/...）。
         - args (Arguments): 配置对象。
         - tokenizer: 文本分词器。
+        - expected_cand_size (Optional[int]): R10/R20 长度；on-the-fly cand 时用（默认从 path 推断）。
 
         输出：
         - 无显式返回值（构造函数）。
@@ -1966,6 +1979,11 @@ class PLDataset(Dataset):
         self.mode = mode
         self.args = args
         self.tokenizer = tokenizer
+        self._expected_cand_size = (
+            expected_cand_size
+            if expected_cand_size is not None
+            else _expected_cand_size_from_path(str(path))
+        )
 
     def __len__(self):
         """
@@ -2097,18 +2115,33 @@ class PLDataset(Dataset):
             mask_context_attention_mask = None
 
         if self.args.test_with_cand:
-            cand = sample.get('cand')
-            if cand is not None:
-                cand = [int(id) for id in cand]
-            elif img_id is not None and neg_img_id is not None:
-                # Build R10 on-the-fly: 1 pos + 9 neg (incl. provided neg_img_id)
-                exclude = {int(img_id), int(neg_img_id)}
-                pool = [i for i in range(self.args.max_image_id) if i not in exclude]
-                n_extra = min(8, len(pool))
-                extra = random.sample(pool, n_extra) if n_extra > 0 else []
-                cand = [int(img_id), int(neg_img_id)] + extra
+            raw_cand = sample.get('cand')
+            # Empty JSON list [] must behave like missing cand (else collate passes [[]]).
+            if isinstance(raw_cand, list) and len(raw_cand) > 0:
+                cand = [int(id) for id in raw_cand]
+            elif img_id is not None:
+                # Global distractors (no reliance on same-pack neg_img_id from release).
+                pos = int(img_id)
+                size = int(self._expected_cand_size or 10)
+                n_other = size - 1
+                pool = [i for i in range(self.args.max_image_id) if i != pos]
+                if len(pool) < n_other:
+                    raise ValueError(
+                        f"PLDataset index={index}: need {n_other} distractors, pool={len(pool)}"
+                    )
+                others = random.sample(pool, n_other)
+                cand = [pos] + others
+                if neg_img_id is None:
+                    neg_img_id = others[0]
             else:
                 cand = None
+            if cand is None and (
+                getattr(self.args, 'candidate_eval_only', False)
+                or self.args.test_with_cand
+            ):
+                raise ValueError(
+                    f"PLDataset index={index}: missing or empty cand and no img_id for on-the-fly build."
+                )
         else:
             cand = None
         user_id = _resolve_user_key(sample, dialog, index)
@@ -2127,26 +2160,6 @@ class PLDataset(Dataset):
             'mask_context_attention_mask': mask_context_attention_mask
         }
         return res
-        # return {k:v for k, v in res.items() if v is not None}
-
-        if not self.args.test_with_cand:
-            return {
-                'sent': sent,
-                'img_word': img_word,
-                'img_id': img_id,
-                'neg_img_word': neg_img_word,
-                'neg_img_id': neg_img_id,
-                'emotion_id': emotion_id,
-            }
-        else:
-            return {
-                'sent': sent,
-                'img_word': img_word,
-                'img_id': img_id,
-                'neg_img_word': neg_img_word,
-                'neg_img_id': neg_img_id,
-                'cand': [id for id in self.data[index]['cand']]
-            }
 
 
 class PLDataLoader(pl.LightningDataModule):
@@ -2190,8 +2203,13 @@ class PLDataLoader(pl.LightningDataModule):
         if stage == 'fit' or stage is None:
             logger.info('begin get data')
 
-            self.train_dataset = PLDataset(self.train_data_path,
-                                           self.args.mode, self.args, self.tokenizer)
+            self.train_dataset = PLDataset(
+                self.train_data_path,
+                self.args.mode,
+                self.args,
+                self.tokenizer,
+                expected_cand_size=_expected_cand_size_from_path(self.train_data_path),
+            )
             n_train = len(self.train_dataset)
             logger.info(f"train samples={n_train}, train_batch_size={self.train_batch_size}, "
                         f"steps_per_epoch={max(1, (n_train + self.train_batch_size - 1) // self.train_batch_size)}")
@@ -2199,9 +2217,9 @@ class PLDataLoader(pl.LightningDataModule):
             pe20 = (getattr(self.args, 'per_epoch_eval_test_r20_path', None) or '').strip()
             if pe10 and pe20:
                 self.val_dataset_r10 = PLDataset(
-                    pe10, self.args.mode, self.args, self.tokenizer)
+                    pe10, self.args.mode, self.args, self.tokenizer, expected_cand_size=10)
                 self.val_dataset_r20 = PLDataset(
-                    pe20, self.args.mode, self.args, self.tokenizer)
+                    pe20, self.args.mode, self.args, self.tokenizer, expected_cand_size=20)
                 self._per_epoch_dual_val_loaders = True
                 logger.info(
                     'per-epoch eval: test R10 (%d) + test R20 (%d) — no val split',
@@ -2211,7 +2229,12 @@ class PLDataLoader(pl.LightningDataModule):
             elif self.args.val_data_path:
                 self._per_epoch_dual_val_loaders = False
                 self.val_dataset = PLDataset(
-                    self.val_data_path, self.args.mode, self.args, self.tokenizer)
+                    self.val_data_path,
+                    self.args.mode,
+                    self.args,
+                    self.tokenizer,
+                    expected_cand_size=_expected_cand_size_from_path(self.val_data_path),
+                )
                 logger.info('has val!')
             else:
                 self._per_epoch_dual_val_loaders = False
@@ -2222,7 +2245,12 @@ class PLDataLoader(pl.LightningDataModule):
             logger.info('begin get data')
             if self.args.mode != 'gen':
                 self.test_dataset = PLDataset(
-                    self.test_data_path, self.args.mode, self.args, self.tokenizer)
+                    self.test_data_path,
+                    self.args.mode,
+                    self.args,
+                    self.tokenizer,
+                    expected_cand_size=_expected_cand_size_from_path(self.test_data_path),
+                )
             else:
                 self.test_dataset = PLDataset(
                     self.gen_data_path, self.args.mode, self.args, self.tokenizer)
@@ -2260,8 +2288,9 @@ class PLDataLoader(pl.LightningDataModule):
                              padding=True, truncation=True, max_length=chunk)
         input_ids = res['input_ids']
         attention_mask = res['attention_mask']
-        # R10 评测时，每条样本带固定候选 cand（长度通常是 10）。
-        if batch[0]['cand'] is not None:
+        # R10/R20：仅当 cand 非空才传 cands（避免 [[]] 触发全库回退或 OOM）。
+        c0 = batch[0].get('cand')
+        if isinstance(c0, list) and len(c0) > 0:
             cands = [d['cand'] for d in batch]
         else:
             cands = None
@@ -2296,25 +2325,6 @@ class PLDataLoader(pl.LightningDataModule):
             'mask_context_output_ids': mask_context_output_ids,
             'mask_context_attention_mask': mask_context_attention_mask,
         }
-
-        if self.args.test_with_cand:
-            cands = [d['cand'] for d in batch]
-            return {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'img_ids': img_ids,
-                'neg_img_ids': neg_img_ids,
-                'cands': cands
-            }
-        else:
-            emotion_ids = [d['emotion_id'] for d in batch]
-            return {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'img_ids': img_ids,
-                'neg_img_ids': neg_img_ids,
-                'emotion_ids': emotion_ids
-            }
 
     def train_dataloader(self, ):
         """

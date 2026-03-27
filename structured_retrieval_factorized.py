@@ -29,9 +29,12 @@ from structured_retrieval import (
     StructuredArguments,
     StructuredPLModel,
     StructuredStickerModel,
+    _CAND_EVAL_ONLY_ERR,
     attach_per_epoch_dual_test_eval,
     build_trainer,
     load_checkpoint_to_model,
+    maybe_set_ddp_static_graph,
+    nonempty_batch_cands,
     normalize_sticker_id,
 )
 from structured_retrieval_tokens import (
@@ -1012,13 +1015,18 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
             self._get_eval_or_fresh_bank_factorization(device)
         )
 
-        if cands:
+        use_cands = nonempty_batch_cands(cands)
+        if use_cands:
             candidate_ids = [int(x) for x in cands[0]]
             candidate_idx = torch.tensor(candidate_ids, dtype=torch.long, device=device)
             candidate_h = bank_all_h.index_select(0, candidate_idx)
             candidate_c = style_bank_c.index_select(0, candidate_idx)
             candidate_a = style_bank_a.index_select(0, candidate_idx)
         else:
+            if getattr(self.args, "candidate_eval_only", False) or getattr(
+                self.args, "test_with_cand", False
+            ):
+                raise ValueError(_CAND_EVAL_ONLY_ERR)
             candidate_ids = list(range(self.args.max_image_id))
             candidate_h = bank_all_h
             candidate_c = style_bank_c
@@ -1073,7 +1081,7 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         rank_scores = final_score.unsqueeze(0)
         labels = torch.tensor(img_ids, dtype=torch.long, device=device)
         if not return_debug:
-            return rank_scores, labels, candidate_ids if cands else None
+            return rank_scores, labels, candidate_ids if use_cands else None
 
         gold_id = int(img_ids[0])
         eval_debug = {
@@ -1099,7 +1107,7 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
                 "after candidate union from style/prototype/mmbert branches"
             ),
         }
-        return rank_scores, labels, candidate_ids if cands else None, eval_debug
+        return rank_scores, labels, candidate_ids if use_cands else None, eval_debug
 
 
 class StructuredFactorizedPLModel(StructuredPLModel):
@@ -1185,6 +1193,7 @@ class StructuredFactorizedPLModel(StructuredPLModel):
         }
 
     def on_train_start(self) -> None:
+        maybe_set_ddp_static_graph(self.trainer)
         cache_path = (getattr(self.args, "img_emb_cache_path", None) or "").strip()
         if getattr(self.args, "fix_img", False) and cache_path and os.path.exists(cache_path):
             self.model.prepare_for_test()

@@ -15,8 +15,9 @@ import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 import transformers
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from transformers import AdamW, HfArgumentParser
 
@@ -42,6 +43,21 @@ def eval_retrieval_mode_label(test_with_cand: bool, max_cand_len: int) -> str:
     if max_cand_len > 0:
         return f"R{max_cand_len}(candidates)"
     return "Rcand(candidates)"
+
+
+def nonempty_batch_cands(cands: Optional[Sequence[Sequence[int]]]) -> bool:
+    """True iff collate passed one row with at least one candidate (not [[]])."""
+    return (
+        cands is not None
+        and len(cands) == 1
+        and len(cands[0]) > 0
+    )
+
+
+_CAND_EVAL_ONLY_ERR = (
+    "Eval batch has missing or empty `cands` while candidate_eval_only/test_with_cand "
+    "is set; refusing silent full-bank ranking."
+)
 
 
 def structured_eval_metric_bundle() -> Dict[str, MyAccuracy]:
@@ -1019,10 +1035,15 @@ class StructuredStickerModel(LegacyModel):
 
         q = self.encode_dialogue_query(input_ids, attention_mask)
 
-        if cands:
+        use_cands = nonempty_batch_cands(cands)
+        if use_cands:
             candidate_ids = [int(x) for x in cands[0]]
             candidate_h = self.all_img_embs[candidate_ids]
         else:
+            if getattr(self.args, "candidate_eval_only", False) or getattr(
+                self.args, "test_with_cand", False
+            ):
+                raise ValueError(_CAND_EVAL_ONLY_ERR)
             candidate_ids = list(range(self.args.max_image_id))
             candidate_h = self.all_img_embs
 
@@ -1052,7 +1073,7 @@ class StructuredStickerModel(LegacyModel):
         final_scores = final_score.unsqueeze(0)
         labels = torch.tensor(img_ids, dtype=torch.long, device=device)
         if not return_debug:
-            return final_scores, labels, candidate_ids if cands else None
+            return final_scores, labels, candidate_ids if use_cands else None
         eval_debug = {
             "uses_fused_logits_for_ranking": not self.args.base_only,
             "base_logits_stats": self._tensor_debug_stats(base_logits),
@@ -1080,7 +1101,7 @@ class StructuredStickerModel(LegacyModel):
             ),
             "candidate_count": int(len(candidate_ids)),
         }
-        return final_scores, labels, candidate_ids if cands else None, eval_debug
+        return final_scores, labels, candidate_ids if use_cands else None, eval_debug
 
 
 class StructuredPLModel(pl.LightningModule):
@@ -1692,6 +1713,41 @@ class StructuredPLModel(pl.LightningModule):
         }
 
 
+def maybe_set_ddp_static_graph(trainer: Optional[pl.Trainer]) -> None:
+    """Enable DDP static graph for gradient checkpoint + reentrant backward (idempotent).
+
+    BERT ``gradient_checkpointing`` under multi-GPU DDP otherwise may raise
+    ``RuntimeError: Expected to mark a variable ready only once``.
+    """
+    if trainer is None or getattr(trainer, "world_size", 1) <= 1:
+        return
+    plugins: List[Any] = []
+    ttp = getattr(trainer, "training_type_plugin", None)
+    if ttp is not None:
+        plugins.append(ttp)
+    acc = getattr(trainer, "accelerator", None)
+    if acc is not None:
+        ttp2 = getattr(acc, "training_type_plugin", None)
+        if ttp2 is not None and ttp2 not in plugins:
+            plugins.append(ttp2)
+    for plugin in plugins:
+        wrapped = getattr(plugin, "_model", None)
+        if wrapped is None or not isinstance(wrapped, DistributedDataParallel):
+            continue
+        if getattr(wrapped, "static_graph", False):
+            return
+        if hasattr(wrapped, "_set_static_graph"):
+            wrapped._set_static_graph()
+            return
+
+
+class DdpStaticGraphCallback(Callback):
+    """Trainer callback wrapper for :func:`maybe_set_ddp_static_graph`."""
+
+    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        maybe_set_ddp_static_graph(trainer)
+
+
 def load_checkpoint_to_model(
     model: StructuredPLModel, ckpt_path: str, strict: bool
 ) -> None:
@@ -1718,8 +1774,13 @@ def build_trainer(args: StructuredArguments, for_train: bool) -> pl.Trainer:
         "default_root_dir": args.pl_root_dir,
         "precision": int(getattr(args, "trainer_precision", 32) or 32),
     }
+    callbacks: List[Callback] = []
     if for_train:
-        trainer_kwargs["callbacks"] = [ModelCheckpoint(save_top_k=-1, verbose=True)]
+        callbacks.append(ModelCheckpoint(save_top_k=-1, verbose=True))
+        if args.gpus and args.gpus > 1:
+            callbacks.append(DdpStaticGraphCallback())
+    if callbacks:
+        trainer_kwargs["callbacks"] = callbacks
     if args.gpus and args.gpus > 1:
         trainer_kwargs["accelerator"] = "ddp"
     return pl.Trainer(**trainer_kwargs)

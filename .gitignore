@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Virtual environments (do not commit; thousands of site-packages files)
+.venv/
+venv/
+env/
+
 # IDE / local editor
 .vscode/
 .idea/

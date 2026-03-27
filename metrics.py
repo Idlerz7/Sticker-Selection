@@ -6,13 +6,16 @@ import torch.distributed as dist
 def _myaccuracy_dist_sync_fn(result: torch.Tensor, group=None):
     """
     TorchMetrics state is plain tensors (not buffers), so it often stays on CPU even when
-    the LightningModule is on CUDA. Default gather uses NCCL and requires CUDA tensors.
-    Skip all_gather when not distributed or single-rank so CPU accumulators work.
+    the LightningModule is on CUDA. NCCL all_gather requires CUDA dense tensors; move
+    accumulators to the current rank's GPU before gather. Skip gather when not distributed
+    or single-rank so CPU accumulators still work.
     """
     if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
         return [result]
     from torchmetrics.utilities.distributed import gather_all_tensors
 
+    if dist.get_backend() == "nccl" and torch.cuda.is_available() and result.device.type != "cuda":
+        result = result.to(torch.device("cuda", torch.cuda.current_device()))
     return gather_all_tensors(result, group)
 
 

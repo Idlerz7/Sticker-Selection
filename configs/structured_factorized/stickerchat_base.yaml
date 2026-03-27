@@ -25,5 +25,11 @@ factorized_bank_path: ./stickerchat/processed/factorized_style_bank.json
 factorized_bank_source: style_metadata
 factorized_style_metadata_path: ./stickerchat/processed/sticker_metadata.json
 
+# 0 recomputes full-bank decompose (~174k stickers) every step — very slow. N>0 refreshes a cached bank under no_grad (see _get_train_or_fresh_bank_factorization).
+factorized_train_bank_refresh_steps: 500
+
+# _base.yaml uses 2; MM-BERT StickerChat uses 1 — fewer optimizer steps per epoch, closer wall-clock to MM-BERT (effective batch smaller unless you raise train_batch_size).
+gradient_accumulation_steps: 1
+
 prepare_batch_size: 256
 prepare_workers: 8
