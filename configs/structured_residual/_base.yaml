@@ -1,0 +1,50 @@
+# Shared defaults for Structured Residual V3.
+# This line keeps the legacy sticker slot, then adds projected structure
+# residuals onto that sticker token instead of appending extra tokens.
+
+name: structured_residual_base
+description: "Shared MM-BERT + structured recipe for residual sticker modulation."
+
+mode: train
+gpus: 1
+seed: 2021
+
+fix_img: true
+fix_text: false
+model_choice: use_img_clip
+local_files_only: true
+
+bert_pretrain_path: ./ckpt/bert-base-chinese
+img_pretrain_path: ./ckpt/clip-ViT-B-32
+text_clip_pretrain_path: ./ckpt/clip-ViT-B-32
+
+train_data_path: ./data/train_pair.json
+val_data_path: ./data/validation_pair.json
+test_data_path: ./data/validation_pair.json
+max_image_id: 307
+
+img_emb_cache_path: ./data/meme_set_clip_embs.pt
+
+style_neighbors_path: ./style_neighbors.json
+style_neighbor_topk: 5
+style_sampling_mode: random_topk
+expr_gate_mode: sigmoid
+struct_fuse_mode: full
+lambda_fuse: 3.0
+lambda_struct: 0.5
+
+train_batch_size: 32
+valtest_batch_size: 1
+num_workers: 8
+epochs: 10
+gradient_accumulation_steps: 1
+
+struct_residual_mode: expr
+residual_condition_mode: none
+struct_residual_use_late_fusion: false
+struct_residual_compare_plain_eval: true
+struct_residual_log_interval: 200
+residual_init_gain: 0.1
+
+train_score_decomp_log_interval: 200
+train_prog_bar_mode: compact

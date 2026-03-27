@@ -1,0 +1,4 @@
+extends: _base.yaml
+name: v4_01_style_expr_two_stage
+description: "Two-stage style/prototype recall plus learned fusion reranker."
+pl_root_dir: logs/structured_factorized_v4_01

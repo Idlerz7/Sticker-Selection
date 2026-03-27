@@ -1,0 +1,8 @@
+# Expr structured token only: no img_ff(CLIP) sticker_token in the BERT sequence.
+# Layout: text + [ocr?] + expr_token + SEP  (vs default expr: + sticker_token before expr)
+extends: _base.yaml
+name: v2_01_expr_no_sticker_slot
+description: "Ablation: only expression token injected; drop raw CLIP projection slot."
+struct_token_mode: expr
+struct_token_include_sticker_token: false
+pl_root_dir: logs/structured_tokens_v2_01_expr_no_sticker

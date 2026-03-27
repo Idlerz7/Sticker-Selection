@@ -1,0 +1,6 @@
+# Phase 2: style component only as extra BERT token(s).
+extends: _base.yaml
+name: v2_02_style
+description: "Inject style token (from decomposed `c`) only."
+struct_token_mode: style
+pl_root_dir: logs/structured_tokens_v2_02_style

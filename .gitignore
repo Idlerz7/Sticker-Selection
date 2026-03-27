@@ -17,6 +17,7 @@ dstc_data/
 data/*
 !data/ocr_max10.json
 u-sticker/
+stickerchat/
 
 # Training / evaluation outputs
 logs/

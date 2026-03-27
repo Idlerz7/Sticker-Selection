@@ -1,0 +1,6 @@
+# Phase 3: expr + style tokens (no user token).
+extends: _base.yaml
+name: v2_03_expr_style
+description: "Inject expr then style tokens (order fixed in code)."
+struct_token_mode: expr_style
+pl_root_dir: logs/structured_tokens_v2_03_expr_style

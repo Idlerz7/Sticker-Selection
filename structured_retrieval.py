@@ -1,6 +1,8 @@
 import json
 import os
 import random
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -33,6 +35,66 @@ from utils import try_create_dir
 StickerId = Union[int, str]
 
 
+def eval_retrieval_mode_label(test_with_cand: bool, max_cand_len: int) -> str:
+    """Human-readable eval protocol tag for logs (R10/R20/Rall)."""
+    if not test_with_cand:
+        return "Rall(all-stickers)"
+    if max_cand_len > 0:
+        return f"R{max_cand_len}(candidates)"
+    return "Rcand(candidates)"
+
+
+def structured_eval_metric_bundle() -> Dict[str, MyAccuracy]:
+    """One eval split (R10 or R20 test) worth of MyAccuracy counters."""
+    return {
+        "acc5": MyAccuracy(),
+        "acc30": MyAccuracy(),
+        "acc90": MyAccuracy(),
+        "acc_r10": MyAccuracy(),
+        "acc_r20": MyAccuracy(),
+        "map": MyAccuracy(),
+    }
+
+
+def attach_per_epoch_dual_test_eval(module: Any, args: Any) -> None:
+    """
+    If both paths are set, each training epoch runs validation on test R10 then test R20
+    (no val split). See PLDataLoader.val_dataloader list return.
+    """
+    p10 = (getattr(args, "per_epoch_eval_test_r10_path", None) or "").strip()
+    p20 = (getattr(args, "per_epoch_eval_test_r20_path", None) or "").strip()
+    module._per_epoch_dual_test_eval = bool(p10 and p20)
+    if module._per_epoch_dual_test_eval:
+        module._eval_bundles = (
+            structured_eval_metric_bundle(),
+            structured_eval_metric_bundle(),
+        )
+        module._eval_max_cand_pair = [0, 0]
+    else:
+        module._eval_bundles = None
+
+
+def _with_cand_data_path_if_exists(path: Optional[str]) -> Optional[str]:
+    """If `path` has a known *_with_cand* counterpart on disk, return it; else None."""
+    if not path:
+        return None
+    suffix_map = (
+        ("validation_pair.json", "validation_pair_with_cand.json"),
+        ("u_sticker_val_split.json", "u_sticker_val_split_with_cand.json"),
+        (
+            "release_val_u_sticker_format_int_with_cand.json",
+            "release_val_u_sticker_format_int_with_cand_r10.json",
+        ),
+    )
+    for old_suf, new_suf in suffix_map:
+        if path.endswith(old_suf):
+            cand_path = path[: -len(old_suf)] + new_suf
+            if os.path.isfile(cand_path):
+                return cand_path
+            return None
+    return None
+
+
 def normalize_sticker_id(raw_id: Any) -> StickerId:
     if raw_id is None:
         return ""
@@ -51,19 +113,35 @@ class StructuredArguments(LegacyArguments):
     style_neighbors_path: Optional[str] = field(default="./style_neighbors.json")
     structured_hidden_dim: Optional[int] = field(default=256)
     structured_dropout: Optional[float] = field(default=0.1)
-    alpha_style_neighbor: Optional[float] = field(default=0.1)
-    beta_orth: Optional[float] = field(default=0.05)
-    init_style_match_weight: Optional[float] = field(default=0.5)
-    init_expr_match_weight: Optional[float] = field(default=0.5)
+    # More aggressive defaults so the structured branch is not numerically drowned out
+    # by the legacy MM-BERT base score.
+    lambda_fuse: Optional[float] = field(default=3.0)
+    lambda_struct: Optional[float] = field(default=0.5)
+    lambda_expr: Optional[float] = field(default=0.3)
+    warmup_ratio: Optional[float] = field(default=0.1)
+    expr_margin: Optional[float] = field(default=0.1)
     style_neighbor_topk: Optional[int] = field(default=5)
     style_sampling_mode: Optional[str] = field(default="random_topk")
+    expr_gate_mode: Optional[str] = field(default="sigmoid")
+    # Which terms enter lambda_fuse * structured_term (besides s_base).
+    # full: s_style + expr_mod; style_only: s_style; expr_only: expr_mod only.
+    struct_fuse_mode: Optional[str] = field(default="full")
     strict_checkpoint_load: Optional[bool] = field(default=False)
     save_structured_test_outputs: Optional[bool] = field(default=True)
     debug_smoke_test: Optional[bool] = field(default=False)
     debug_smoke_train_steps: Optional[int] = field(default=3)
     debug_smoke_eval_steps: Optional[int] = field(default=1)
     debug_smoke_log_every_step: Optional[bool] = field(default=True)
+    debug_compare_base_only: Optional[bool] = field(default=False)
     base_only: Optional[bool] = field(default=False)
+    # Log how much base vs structured parts contribute to the fused match score (training batches).
+    # 0 disables. Example: 200 -> one line every 200 optimizer steps.
+    train_score_decomp_log_interval: Optional[int] = field(default=200)
+    # compact: tqdm shows total, match, s_b, pm only (fits narrow terminals). full: all loss fields on bar.
+    train_prog_bar_mode: Optional[str] = field(default="compact")
+    trainer_precision: Optional[int] = field(default=32)
+    allow_tf32: Optional[bool] = field(default=True)
+    cudnn_benchmark: Optional[bool] = field(default=True)
 
     def __post_init__(self):
         super().__post_init__()
@@ -75,14 +153,64 @@ class StructuredArguments(LegacyArguments):
                 f"Unsupported style_sampling_mode={self.style_sampling_mode}. "
                 "Use 'top1' or 'random_topk'."
             )
+        if self.expr_gate_mode not in {"sigmoid", "none", "floor_half"}:
+            raise ValueError(
+                f"Unsupported expr_gate_mode={self.expr_gate_mode}. "
+                "Use 'sigmoid', 'none', or 'floor_half'."
+            )
+        if self.struct_fuse_mode not in {"full", "style_only", "expr_only"}:
+            raise ValueError(
+                f"Unsupported struct_fuse_mode={self.struct_fuse_mode}. "
+                "Use 'full', 'style_only', or 'expr_only'."
+            )
         if self.structured_hidden_dim <= 0:
             raise ValueError("structured_hidden_dim must be > 0.")
+        if self.lambda_fuse < 0:
+            raise ValueError("lambda_fuse must be >= 0.")
+        if self.lambda_struct < 0:
+            raise ValueError("lambda_struct must be >= 0.")
+        if self.lambda_expr < 0:
+            raise ValueError("lambda_expr must be >= 0.")
+        if self.expr_margin < 0:
+            raise ValueError("expr_margin must be >= 0.")
+        if not (0.0 <= self.warmup_ratio <= 1.0):
+            raise ValueError("warmup_ratio must be in [0, 1].")
         if self.style_neighbor_topk < 0:
             raise ValueError("style_neighbor_topk must be >= 0.")
         if self.debug_smoke_train_steps <= 0:
             raise ValueError("debug_smoke_train_steps must be > 0.")
         if self.debug_smoke_eval_steps <= 0:
             raise ValueError("debug_smoke_eval_steps must be > 0.")
+        if self.train_score_decomp_log_interval is not None and self.train_score_decomp_log_interval < 0:
+            raise ValueError("train_score_decomp_log_interval must be >= 0 (0 = off).")
+        if self.train_prog_bar_mode is None:
+            self.train_prog_bar_mode = "compact"
+        if self.train_prog_bar_mode not in {"compact", "full"}:
+            raise ValueError("train_prog_bar_mode must be 'compact' or 'full'.")
+        if self.trainer_precision not in {16, 32, 64}:
+            raise ValueError("trainer_precision must be one of {16, 32, 64}.")
+        # Training / pretrain validation always uses R10 (candidates), not full-corpus Rall.
+        if self.mode in {"train", "pretrain"}:
+            self.test_with_cand = True
+            pe10 = (getattr(self, "per_epoch_eval_test_r10_path", None) or "").strip()
+            pe20 = (getattr(self, "per_epoch_eval_test_r20_path", None) or "").strip()
+            if pe10 and pe20:
+                self.val_data_path = ""
+                logger.info(
+                    "[StructuredArgs] per-epoch eval on test R10+R20 only; val_data_path cleared."
+                )
+            else:
+                old_val = self.val_data_path
+                upgraded = _with_cand_data_path_if_exists(old_val)
+                if upgraded is not None:
+                    logger.info(
+                        "[StructuredArgs] Training val uses fixed candidates: val_data_path %s -> %s",
+                        old_val,
+                        upgraded,
+                    )
+                    self.val_data_path = upgraded
+                    if self.test_data_path == old_val:
+                        self.test_data_path = upgraded
 
 
 @dataclass
@@ -91,13 +219,21 @@ class StructuredForwardOutput:
     match_loss: torch.Tensor
     style_neighbor_loss: torch.Tensor
     orth_loss: torch.Tensor
+    expr_rank_loss: torch.Tensor
+    aux_warmup: torch.Tensor
     pos_fused_logits: torch.Tensor
     neg_fused_logits: torch.Tensor
     pos_style_score: torch.Tensor
     pos_expr_score: torch.Tensor
     neg_style_score: torch.Tensor
     neg_expr_score: torch.Tensor
+    pos_style_gate: torch.Tensor
+    neg_style_gate: torch.Tensor
+    pos_expr_mod: torch.Tensor
+    neg_expr_mod: torch.Tensor
     debug_info: Optional[Dict[str, Any]] = None
+    # Detached scalars: what magnitudes drive pos/neg fused scores in this batch.
+    score_decomp: Optional[Dict[str, float]] = None
 
 
 class StyleNeighborStore:
@@ -208,18 +344,11 @@ class ScalarMatchHead(nn.Module):
 
     def forward(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
         return self.net(torch.cat([left, right], dim=-1)).squeeze(-1)
-
-
-def softplus_inverse_scalar(value: float) -> torch.Tensor:
-    value = max(float(value), 1e-6)
-    tensor_value = torch.tensor(value, dtype=torch.float32)
-    return torch.log(torch.expm1(tensor_value))
-
-
 class StructuredStickerModel(LegacyModel):
     """
     Reuses the original text/image backbones from `main.Model`,
-    while re-organizing the retrieval logic into a cleaner structured version.
+    while keeping a unified dialogue query and a structured sticker-side
+    decomposition in a low-hyperparameter configuration.
     """
 
     def __init__(self, args: StructuredArguments):
@@ -243,11 +372,8 @@ class StructuredStickerModel(LegacyModel):
         self.expr_match_head = ScalarMatchHead(
             args.structured_hidden_dim, args.structured_dropout
         )
-        self.style_match_weight = nn.Parameter(
-            softplus_inverse_scalar(float(args.init_style_match_weight))
-        )
-        self.expr_match_weight = nn.Parameter(
-            softplus_inverse_scalar(float(args.init_expr_match_weight))
+        self.style_gate_head = ScalarMatchHead(
+            args.structured_hidden_dim, args.structured_dropout
         )
         self.loss_fct = nn.CrossEntropyLoss()
         self.neighbor_store = StyleNeighborStore.from_json(args.style_neighbors_path)
@@ -324,20 +450,36 @@ class StructuredStickerModel(LegacyModel):
                 assert self.all_img_embs.size(0) == self.args.max_image_id
                 return
 
-            img_objs = [self.get_image_obj(idx) for idx in range(self.args.max_image_id)]
-            img_tokens = self.img_clip.tokenize(img_objs)
+            batch_size = int(getattr(self.args, "prepare_batch_size", 512) or 512)
+            workers = int(getattr(self.args, "prepare_workers", 8) or 8)
             if hasattr(self.img_clip, "model"):
                 clip_device = next(self.img_clip.model.parameters()).device
             elif hasattr(self.img_clip, "_target_device"):
                 clip_device = self.img_clip._target_device
             else:
                 clip_device = next(self.bert.parameters()).device
-            img_tokens = {
-                k: v.to(clip_device) if hasattr(v, "to") else v
-                for k, v in img_tokens.items()
-            }
             self.img_clip.eval()
-            self.all_img_embs = self.img_clip.forward(img_tokens)["sentence_embedding"]
+            all_embs: List[torch.Tensor] = []
+
+            def load_one(sticker_id: int):
+                return sticker_id, self.get_image_obj(sticker_id)
+
+            for start in range(0, self.args.max_image_id, batch_size):
+                end = min(start + batch_size, self.args.max_image_id)
+                ids_batch = list(range(start, end))
+                img_objs = [None] * len(ids_batch)
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futures = {ex.submit(load_one, idx): idx for idx in ids_batch}
+                    for future in as_completed(futures):
+                        idx, obj = future.result()
+                        img_objs[idx - start] = obj
+                img_tokens = self.img_clip.tokenize(img_objs)
+                img_tokens = {
+                    k: v.to(clip_device) if hasattr(v, "to") else v
+                    for k, v in img_tokens.items()
+                }
+                all_embs.append(self.img_clip.forward(img_tokens)["sentence_embedding"])
+            self.all_img_embs = torch.cat(all_embs, dim=0)
             if cache_path:
                 d = os.path.dirname(cache_path)
                 if d:
@@ -399,9 +541,7 @@ class StructuredStickerModel(LegacyModel):
     def encode_dialogue_query(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        # q is a dialogue-only query representation.
-        # It is extracted from pure text without any candidate sticker token,
-        # so s_style / s_expr are conditioned on dialogue semantics only.
+        # Unified dialogue query from pure text only.
         text_emb = self._get_text_word_embeddings(input_ids)
         outputs = self.bert.bert(
             inputs_embeds=text_emb,
@@ -411,36 +551,82 @@ class StructuredStickerModel(LegacyModel):
         q = outputs.last_hidden_state[:, 0, :]
         return self.query_head(q)
 
-    def decompose_sticker(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def decompose_sticker(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Shared sticker base -> style-oriented stable component + response-oriented
+        # expression component. No hard normalization is applied here.
         u = self.shared_sticker_head(h)
-        return self.style_head(u), self.expr_head(u)
+        c = self.style_head(u)
+        a = self.expr_head(u)
+        return u, c, a
 
-    def score_query_to_components(
-        self, q: torch.Tensor, c: torch.Tensor, a: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        style_score = self.style_match_head(q, c)
-        expr_score = self.expr_match_head(q, a)
-        return style_score, expr_score
+    def compute_style_compatibility(self, q: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        return self.style_match_head(q, c)
 
-    def get_nonnegative_match_weights(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return F.softplus(self.style_match_weight), F.softplus(self.expr_match_weight)
+    def compute_expression_compatibility(
+        self, q: torch.Tensor, a: torch.Tensor
+    ) -> torch.Tensor:
+        return self.expr_match_head(q, a)
 
-    def fuse_logits(
+    def compute_style_gate(self, q: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        # Style-conditioned expression modulation gate in (0, 1).
+        return torch.sigmoid(self.style_gate_head(q, c))
+
+    def modulate_expression_score(
+        self, expr_score: torch.Tensor, style_gate: torch.Tensor
+    ) -> torch.Tensor:
+        if self.args.expr_gate_mode == "none":
+            return expr_score
+        if self.args.expr_gate_mode == "floor_half":
+            return (0.5 + 0.5 * style_gate) * expr_score
+        return style_gate * expr_score
+
+    def describe_expr_gate_mode(self) -> str:
+        if self.args.expr_gate_mode == "none":
+            return "expr_mod = s_expr"
+        if self.args.expr_gate_mode == "floor_half":
+            return "expr_mod = (0.5 + 0.5 * style_gate) * s_expr"
+        return "expr_mod = style_gate * s_expr"
+
+    def expr_mod_subformula(self) -> str:
+        if self.args.expr_gate_mode == "none":
+            return "s_expr"
+        if self.args.expr_gate_mode == "floor_half":
+            return "(0.5 + 0.5 * style_gate) * s_expr"
+        return "style_gate * s_expr"
+
+    def structured_term_formula(self) -> str:
+        em = self.expr_mod_subformula()
+        if self.args.struct_fuse_mode == "style_only":
+            return "s_style"
+        if self.args.struct_fuse_mode == "expr_only":
+            return em
+        return f"s_style + ({em})"
+
+    def compute_base_score(self, logits: torch.Tensor) -> torch.Tensor:
+        return logits[:, 1] - logits[:, 0]
+
+    def fuse_final_score(
         self,
-        logits: torch.Tensor,
+        base_score: torch.Tensor,
         style_score: torch.Tensor,
         expr_score: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        style_gate: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        expr_mod = self.modulate_expression_score(expr_score, style_gate)
+        if self.args.struct_fuse_mode == "style_only":
+            structured_term = style_score
+        elif self.args.struct_fuse_mode == "expr_only":
+            structured_term = expr_mod
+        else:
+            structured_term = style_score + expr_mod
         if self.args.base_only:
-            delta = torch.zeros_like(style_score)
-            fused_logits = logits
-            return fused_logits, delta
-        style_w, expr_w = self.get_nonnegative_match_weights()
-        delta = style_w * style_score + expr_w * expr_score
-        fused_logits = torch.stack(
-            [logits[:, 0] - delta, logits[:, 1] + delta], dim=-1
-        )
-        return fused_logits, delta
+            final_score = base_score
+        else:
+            final_score = base_score + self.args.lambda_fuse * structured_term
+        return final_score, structured_term, expr_mod
+
+    def score_to_logits(self, final_score: torch.Tensor) -> torch.Tensor:
+        return torch.stack([-final_score, final_score], dim=-1)
 
     def _compute_pair_logits(
         self,
@@ -474,13 +660,15 @@ class StructuredStickerModel(LegacyModel):
     def _compute_style_neighbor_loss_with_meta(
         self, pos_img_ids: Sequence[int], c_i: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        # Weakly supervised style neighborhood only constrains the
+        # style-oriented stable component c_i.
         debug_meta: Dict[str, Any] = {
             "valid_style_neighbor_pairs": 0,
             "total_positive_samples": len(pos_img_ids),
             "missing_neighbor_img_ids": [],
             "sampled_neighbor_pairs_preview": [],
         }
-        if self.args.alpha_style_neighbor <= 0 or self.args.style_neighbor_topk <= 0:
+        if self.args.lambda_struct <= 0 or self.args.style_neighbor_topk <= 0:
             return c_i.new_zeros(()), debug_meta
 
         valid_indices: List[int] = []
@@ -510,7 +698,7 @@ class StructuredStickerModel(LegacyModel):
             return sample_loss.mean(), debug_meta
 
         neighbor_h = self.get_emb_by_imgids(valid_neighbor_ids)
-        neighbor_c, _ = self.decompose_sticker(neighbor_h)
+        _, neighbor_c, _ = self.decompose_sticker(neighbor_h)
         valid_c = c_i[torch.tensor(valid_indices, device=c_i.device, dtype=torch.long)]
         if self.args.debug_smoke_test:
             assert (
@@ -525,6 +713,85 @@ class StructuredStickerModel(LegacyModel):
 
     def compute_orth_loss(self, c_i: torch.Tensor, a_i: torch.Tensor) -> torch.Tensor:
         return torch.pow(self._cosine_similarity_from_raw(c_i, a_i), 2).mean()
+
+    def compute_expr_rank_loss(
+        self, pos_expr_mod: torch.Tensor, neg_expr_mod: torch.Tensor
+    ) -> torch.Tensor:
+        """Margin rank on gated expression scores (same as used in fuse_final_score)."""
+        margin = float(self.args.expr_margin)
+        return F.relu(margin - pos_expr_mod + neg_expr_mod).mean()
+
+    def compute_aux_warmup(
+        self, global_step: int, total_steps: Optional[int]
+    ) -> torch.Tensor:
+        if total_steps is None or total_steps <= 0:
+            total_steps = 1
+        warmup_steps = int(float(self.args.warmup_ratio) * float(total_steps))
+        if warmup_steps <= 0:
+            return torch.tensor(1.0, dtype=torch.float32)
+        return torch.tensor(
+            min(1.0, float(global_step) / float(warmup_steps)), dtype=torch.float32
+        )
+
+    def _batch_match_score_decomp(
+        self,
+        pos_base_score: torch.Tensor,
+        neg_base_score: torch.Tensor,
+        pos_style_score: torch.Tensor,
+        neg_style_score: torch.Tensor,
+        pos_expr_mod: torch.Tensor,
+        neg_expr_mod: torch.Tensor,
+        pos_structured_term: torch.Tensor,
+        neg_structured_term: torch.Tensor,
+        pos_final_score: torch.Tensor,
+        neg_final_score: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Scalar summary: which terms dominate s_final for the contrastive match objective."""
+        with torch.no_grad():
+            lam = float(self.args.lambda_fuse)
+
+            def pair_mean_abs(a: torch.Tensor, b: torch.Tensor) -> float:
+                x = torch.cat([a.detach().float().reshape(-1), b.detach().float().reshape(-1)])
+                return float(x.abs().mean().item())
+
+            base_mabs = pair_mean_abs(pos_base_score, neg_base_score)
+            rank_margin = float(
+                (pos_final_score - neg_final_score).detach().float().mean().item()
+            )
+
+            if self.args.base_only:
+                return {
+                    "base_mabs": base_mabs,
+                    "lam_struct_mabs": 0.0,
+                    "lam_style_mabs": 0.0,
+                    "lam_expr_mod_mabs": 0.0,
+                    "struct_over_base": 0.0,
+                    "rank_margin_mean": rank_margin,
+                }
+
+            lam_struct_mabs = pair_mean_abs(
+                lam * pos_structured_term, lam * neg_structured_term
+            )
+            mode = self.args.struct_fuse_mode
+            if mode == "full":
+                lam_style_mabs = pair_mean_abs(lam * pos_style_score, lam * neg_style_score)
+                lam_expr_mabs = pair_mean_abs(lam * pos_expr_mod, lam * neg_expr_mod)
+            elif mode == "style_only":
+                lam_style_mabs = pair_mean_abs(lam * pos_style_score, lam * neg_style_score)
+                lam_expr_mabs = 0.0
+            else:
+                lam_style_mabs = 0.0
+                lam_expr_mabs = pair_mean_abs(lam * pos_expr_mod, lam * neg_expr_mod)
+
+            struct_over_base = lam_struct_mabs / max(base_mabs, 1e-8)
+            return {
+                "base_mabs": base_mabs,
+                "lam_struct_mabs": lam_struct_mabs,
+                "lam_style_mabs": lam_style_mabs,
+                "lam_expr_mod_mabs": lam_expr_mabs,
+                "struct_over_base": struct_over_base,
+                "rank_margin_mean": rank_margin,
+            }
 
     def _tensor_debug_stats(self, x: torch.Tensor) -> Dict[str, Any]:
         with torch.no_grad():
@@ -552,6 +819,8 @@ class StructuredStickerModel(LegacyModel):
         attention_mask: torch.Tensor,
         img_ids: Sequence[int],
         neg_img_ids: Sequence[int],
+        global_step: int = 0,
+        total_steps: Optional[int] = None,
     ) -> StructuredForwardOutput:
         device = input_ids.device
         batch_size = input_ids.size(0)
@@ -580,18 +849,18 @@ class StructuredStickerModel(LegacyModel):
             img_emb=neg_h,
         )
 
-        pos_u = self.shared_sticker_head(pos_h)
-        neg_u = self.shared_sticker_head(neg_h)
-        pos_c = self.style_head(pos_u)
-        neg_c = self.style_head(neg_u)
-        pos_a = self.expr_head(pos_u)
-        neg_a = self.expr_head(neg_u)
+        pos_u, pos_c, pos_a = self.decompose_sticker(pos_h)
+        neg_u, neg_c, neg_a = self.decompose_sticker(neg_h)
         if self.args.debug_smoke_test:
             assert pos_c.shape == pos_a.shape, "pos c/a shape mismatch"
             assert neg_c.shape == neg_a.shape, "neg c/a shape mismatch"
 
-        pos_style_score, pos_expr_score = self.score_query_to_components(q, pos_c, pos_a)
-        neg_style_score, neg_expr_score = self.score_query_to_components(q, neg_c, neg_a)
+        pos_style_score = self.compute_style_compatibility(q, pos_c)
+        neg_style_score = self.compute_style_compatibility(q, neg_c)
+        pos_expr_score = self.compute_expression_compatibility(q, pos_a)
+        neg_expr_score = self.compute_expression_compatibility(q, neg_a)
+        pos_style_gate = self.compute_style_gate(q, pos_c)
+        neg_style_gate = self.compute_style_gate(q, neg_c)
         if self.args.debug_smoke_test:
             assert (
                 pos_style_score.shape == pos_expr_score.shape
@@ -600,12 +869,16 @@ class StructuredStickerModel(LegacyModel):
                 neg_style_score.shape == neg_expr_score.shape
             ), "neg style/expr score shape mismatch"
 
-        pos_fused_logits, pos_delta = self.fuse_logits(
-            pos_logits, pos_style_score, pos_expr_score
+        pos_base_score = self.compute_base_score(pos_logits)
+        neg_base_score = self.compute_base_score(neg_logits)
+        pos_final_score, pos_structured_term, pos_expr_mod = self.fuse_final_score(
+            pos_base_score, pos_style_score, pos_expr_score, pos_style_gate
         )
-        neg_fused_logits, neg_delta = self.fuse_logits(
-            neg_logits, neg_style_score, neg_expr_score
+        neg_final_score, neg_structured_term, neg_expr_mod = self.fuse_final_score(
+            neg_base_score, neg_style_score, neg_expr_score, neg_style_gate
         )
+        pos_fused_logits = self.score_to_logits(pos_final_score)
+        neg_fused_logits = self.score_to_logits(neg_final_score)
         if self.args.debug_smoke_test:
             assert pos_fused_logits.shape[-1] == 2, "pos fused logits last dim must be 2"
             assert neg_fused_logits.shape[-1] == 2, "neg fused logits last dim must be 2"
@@ -618,20 +891,25 @@ class StructuredStickerModel(LegacyModel):
             img_ids, pos_c
         )
         orth_loss = self.compute_orth_loss(pos_c, pos_a)
-        total_loss = (
-            match_loss
-            + self.args.alpha_style_neighbor * style_neighbor_loss
-            + self.args.beta_orth * orth_loss
+        # Align with inference: rank loss on gated expression (style_gate * expr_score), not raw expr_score.
+        expr_rank_loss = self.compute_expr_rank_loss(pos_expr_mod, neg_expr_mod)
+        aux_warmup = self.compute_aux_warmup(global_step=global_step, total_steps=total_steps).to(
+            device=device
         )
+        structured_aux = self.args.lambda_struct * (style_neighbor_loss + orth_loss)
+        expr_aux = self.args.lambda_expr * expr_rank_loss
+        if self.args.base_only:
+            structured_aux = structured_aux * 0.0
+            expr_aux = expr_aux * 0.0
+        total_loss = match_loss + aux_warmup * (structured_aux + expr_aux)
         if self.args.debug_smoke_test:
             assert not torch.isnan(total_loss).any(), "final_loss has NaN"
             assert not torch.isinf(total_loss).any(), "final_loss has Inf"
 
         debug_info = None
         if self.args.debug_smoke_test:
-            style_w, expr_w = self.get_nonnegative_match_weights()
-            pos_logit_delta = (pos_fused_logits - pos_logits).detach()
-            neg_logit_delta = (neg_fused_logits - neg_logits).detach()
+            pos_score_delta = (pos_final_score - pos_base_score).detach()
+            neg_score_delta = (neg_final_score - neg_base_score).detach()
             debug_info = {
                 "batch_size": batch_size,
                 "input_ids_shape": tuple(input_ids.shape),
@@ -647,45 +925,78 @@ class StructuredStickerModel(LegacyModel):
                 "neg_c_stats": self._tensor_debug_stats(neg_c),
                 "pos_a_stats": self._tensor_debug_stats(pos_a),
                 "neg_a_stats": self._tensor_debug_stats(neg_a),
+                "pos_base_score_stats": self._tensor_debug_stats(pos_base_score),
+                "neg_base_score_stats": self._tensor_debug_stats(neg_base_score),
                 "pos_style_score_stats": self._tensor_debug_stats(pos_style_score),
                 "neg_style_score_stats": self._tensor_debug_stats(neg_style_score),
                 "pos_expr_score_stats": self._tensor_debug_stats(pos_expr_score),
                 "neg_expr_score_stats": self._tensor_debug_stats(neg_expr_score),
-                "style_weight_raw": float(self.style_match_weight.detach().item()),
-                "expr_weight_raw": float(self.expr_match_weight.detach().item()),
-                "style_weight_softplus": float(style_w.detach().item()),
-                "expr_weight_softplus": float(expr_w.detach().item()),
-                "pos_delta_stats": self._tensor_debug_stats(pos_delta),
-                "neg_delta_stats": self._tensor_debug_stats(neg_delta),
+                "pos_style_gate_stats": self._tensor_debug_stats(pos_style_gate),
+                "neg_style_gate_stats": self._tensor_debug_stats(neg_style_gate),
+                "pos_expr_mod_stats": self._tensor_debug_stats(pos_expr_mod),
+                "neg_expr_mod_stats": self._tensor_debug_stats(neg_expr_mod),
+                "pos_structured_term_stats": self._tensor_debug_stats(pos_structured_term),
+                "neg_structured_term_stats": self._tensor_debug_stats(neg_structured_term),
+                "lambda_fuse": float(self.args.lambda_fuse),
+                "lambda_struct": float(self.args.lambda_struct),
+                "lambda_expr": float(self.args.lambda_expr),
+                "aux_warmup": float(aux_warmup.detach().item()),
                 "pos_logits_stats": self._tensor_debug_stats(pos_logits),
                 "neg_logits_stats": self._tensor_debug_stats(neg_logits),
                 "pos_fused_logits_stats": self._tensor_debug_stats(pos_fused_logits),
                 "neg_fused_logits_stats": self._tensor_debug_stats(neg_fused_logits),
-                "pos_logit_delta_stats": self._tensor_debug_stats(pos_logit_delta),
-                "neg_logit_delta_stats": self._tensor_debug_stats(neg_logit_delta),
-                "pos_logit_delta_abs_mean": float(pos_logit_delta.abs().mean().item()),
-                "neg_logit_delta_abs_mean": float(neg_logit_delta.abs().mean().item()),
+                "pos_score_delta_stats": self._tensor_debug_stats(pos_score_delta),
+                "neg_score_delta_stats": self._tensor_debug_stats(neg_score_delta),
+                "pos_score_delta_abs_mean": float(pos_score_delta.abs().mean().item()),
+                "neg_score_delta_abs_mean": float(neg_score_delta.abs().mean().item()),
                 "pos_match_loss": float(pos_loss.detach().item()),
                 "neg_match_loss": float(neg_loss.detach().item()),
                 "match_loss": float(match_loss.detach().item()),
                 "style_neighbor_loss": float(style_neighbor_loss.detach().item()),
                 "orth_loss": float(orth_loss.detach().item()),
+                "expr_rank_loss": float(expr_rank_loss.detach().item()),
                 "final_loss": float(total_loss.detach().item()),
+                "pos_style_score_mean": float(pos_style_score.detach().mean().item()),
+                "neg_style_score_mean": float(neg_style_score.detach().mean().item()),
+                "pos_expr_score_mean": float(pos_expr_score.detach().mean().item()),
+                "neg_expr_score_mean": float(neg_expr_score.detach().mean().item()),
+                "pos_style_gate_mean": float(pos_style_gate.detach().mean().item()),
+                "neg_style_gate_mean": float(neg_style_gate.detach().mean().item()),
                 "style_neighbor_meta": style_neighbor_meta,
             }
+
+        score_decomp = self._batch_match_score_decomp(
+            pos_base_score,
+            neg_base_score,
+            pos_style_score,
+            neg_style_score,
+            pos_expr_mod,
+            neg_expr_mod,
+            pos_structured_term,
+            neg_structured_term,
+            pos_final_score,
+            neg_final_score,
+        )
 
         return StructuredForwardOutput(
             loss=total_loss,
             match_loss=match_loss,
             style_neighbor_loss=style_neighbor_loss,
             orth_loss=orth_loss,
+            expr_rank_loss=expr_rank_loss,
+            aux_warmup=aux_warmup,
             pos_fused_logits=pos_fused_logits,
             neg_fused_logits=neg_fused_logits,
             pos_style_score=pos_style_score,
             pos_expr_score=pos_expr_score,
             neg_style_score=neg_style_score,
             neg_expr_score=neg_expr_score,
+            pos_style_gate=pos_style_gate,
+            neg_style_gate=neg_style_gate,
+            pos_expr_mod=pos_expr_mod,
+            neg_expr_mod=neg_expr_mod,
             debug_info=debug_info,
+            score_decomp=score_decomp,
         )
 
     def forward_eval_batch(
@@ -729,29 +1040,44 @@ class StructuredStickerModel(LegacyModel):
         )
 
         candidate_q = q.repeat(img_num, 1)
-        candidate_c, candidate_a = self.decompose_sticker(candidate_h)
-        # s_style / s_expr are compatibility scores between the dialogue-only
-        # query q and the candidate's decomposed style / expression components.
-        style_score, expr_score = self.score_query_to_components(
-            candidate_q, candidate_c, candidate_a
+        _, candidate_c, candidate_a = self.decompose_sticker(candidate_h)
+        style_score = self.compute_style_compatibility(candidate_q, candidate_c)
+        expr_score = self.compute_expression_compatibility(candidate_q, candidate_a)
+        style_gate = self.compute_style_gate(candidate_q, candidate_c)
+        base_score = self.compute_base_score(base_logits)
+        final_score, structured_term, expr_mod = self.fuse_final_score(
+            base_score, style_score, expr_score, style_gate
         )
-        fused_logits, _ = self.fuse_logits(base_logits, style_score, expr_score)
-        # Evaluation ranking explicitly uses fused logits.
-        final_scores = (fused_logits[:, 1] - fused_logits[:, 0]).unsqueeze(0)
+        fused_logits = self.score_to_logits(final_score)
+        final_scores = final_score.unsqueeze(0)
         labels = torch.tensor(img_ids, dtype=torch.long, device=device)
         if not return_debug:
             return final_scores, labels, candidate_ids if cands else None
         eval_debug = {
-            "uses_fused_logits_for_ranking": True,
+            "uses_fused_logits_for_ranking": not self.args.base_only,
             "base_logits_stats": self._tensor_debug_stats(base_logits),
+            "base_score_stats": self._tensor_debug_stats(base_score),
             "fused_logits_stats": self._tensor_debug_stats(fused_logits),
             "final_scores_stats": self._tensor_debug_stats(final_scores),
             "style_score_stats": self._tensor_debug_stats(style_score),
             "expr_score_stats": self._tensor_debug_stats(expr_score),
-            "fused_minus_base_abs_mean": float(
-                (fused_logits - base_logits).abs().mean().item()
+            "style_gate_stats": self._tensor_debug_stats(style_gate),
+            "expr_mod_stats": self._tensor_debug_stats(expr_mod),
+            "structured_term_stats": self._tensor_debug_stats(structured_term),
+            "scaled_structured_term_stats": self._tensor_debug_stats(
+                (float(self.args.lambda_fuse) * structured_term)
             ),
-            "ranking_score_formula": "fused_logits[:,1] - fused_logits[:,0]",
+            "fused_minus_base_abs_mean": float((final_score - base_score).abs().mean().item()),
+            "top1_flipped": bool(torch.argmax(base_score).item() != torch.argmax(final_score).item()),
+            "base_only_scores_stats": self._tensor_debug_stats(base_score.unsqueeze(0)),
+            "lambda_fuse": float(self.args.lambda_fuse),
+            "expr_gate_mode": self.args.expr_gate_mode,
+            "struct_fuse_mode": self.args.struct_fuse_mode,
+            "ranking_score_formula": (
+                f"s_final = s_base + lambda_fuse * ({self.structured_term_formula()})"
+                if not self.args.base_only
+                else "s_final = s_base (base_only analysis)"
+            ),
             "candidate_count": int(len(candidate_ids)),
         }
         return final_scores, labels, candidate_ids if cands else None, eval_debug
@@ -767,13 +1093,64 @@ class StructuredPLModel(pl.LightningModule):
         self.valtest_acc5 = MyAccuracy()
         self.valtest_acc30 = MyAccuracy()
         self.valtest_acc90 = MyAccuracy()
+        self.valtest_acc_r10 = MyAccuracy()
+        self.valtest_acc_r20 = MyAccuracy()
         self.valtest_map = MyAccuracy()
+        self._eval_max_cand_len = 0
+        attach_per_epoch_dual_test_eval(self, args)
 
         self.id2name: Dict[int, str] = {}
-        with open("./data/id2name.json", encoding="utf-8") as f:
+        with open(args.id2name_path, encoding="utf-8") as f:
             raw = json.load(f)
         for k, v in raw.items():
             self.id2name[int(k)] = v
+        self._reset_eval_diagnostics()
+        self._match_score_sb_ema: Optional[float] = None
+        self._match_score_margin_ema: Optional[float] = None
+
+    def _reset_eval_diagnostics(self) -> None:
+        self.eval_diag_count = 0
+        self.eval_base_score_std_sum = 0.0
+        self.eval_style_score_std_sum = 0.0
+        self.eval_expr_mod_std_sum = 0.0
+        self.eval_structured_term_std_sum = 0.0
+        self.eval_scaled_structured_term_std_sum = 0.0
+        self.eval_struct_over_base_ratio_sum = 0.0
+        self.eval_fused_minus_base_abs_mean_sum = 0.0
+        self.eval_top1_flip_count = 0
+
+    def _update_eval_diagnostics(self, eval_debug: Dict[str, Any]) -> None:
+        base_std = float(eval_debug["base_score_stats"]["std"])
+        style_std = float(eval_debug["style_score_stats"]["std"])
+        expr_mod_std = float(eval_debug["expr_mod_stats"]["std"])
+        structured_std = float(eval_debug["structured_term_stats"]["std"])
+        scaled_structured_std = float(eval_debug["scaled_structured_term_stats"]["std"])
+        ratio = scaled_structured_std / max(base_std, 1e-8)
+
+        self.eval_diag_count += 1
+        self.eval_base_score_std_sum += base_std
+        self.eval_style_score_std_sum += style_std
+        self.eval_expr_mod_std_sum += expr_mod_std
+        self.eval_structured_term_std_sum += structured_std
+        self.eval_scaled_structured_term_std_sum += scaled_structured_std
+        self.eval_struct_over_base_ratio_sum += ratio
+        self.eval_fused_minus_base_abs_mean_sum += float(eval_debug["fused_minus_base_abs_mean"])
+        self.eval_top1_flip_count += int(bool(eval_debug["top1_flipped"]))
+
+    def _eval_diagnostics_summary(self) -> Dict[str, float]:
+        if self.eval_diag_count <= 0:
+            return {}
+        denom = float(self.eval_diag_count)
+        return {
+            "base_score_std": self.eval_base_score_std_sum / denom,
+            "style_score_std": self.eval_style_score_std_sum / denom,
+            "expr_mod_std": self.eval_expr_mod_std_sum / denom,
+            "structured_term_std": self.eval_structured_term_std_sum / denom,
+            "scaled_structured_term_std": self.eval_scaled_structured_term_std_sum / denom,
+            "struct_over_base_ratio": self.eval_struct_over_base_ratio_sum / denom,
+            "fused_minus_base_abs_mean": self.eval_fused_minus_base_abs_mean_sum / denom,
+            "top1_flip_rate": self.eval_top1_flip_count / denom,
+        }
 
     def _debug_assert_tensor_finite(self, name: str, x: torch.Tensor) -> None:
         if torch.isnan(x).any():
@@ -792,13 +1169,17 @@ class StructuredPLModel(pl.LightningModule):
         logger.info(
             "[DebugTrainSummary] "
             f"step={step} batch_size={debug_info['batch_size']} "
-            f"style_w={debug_info['style_weight_softplus']:.4f} "
-            f"expr_w={debug_info['expr_weight_softplus']:.4f} "
-            f"delta_pos_mean={debug_info['pos_delta_stats']['mean']:.4f} "
-            f"delta_neg_mean={debug_info['neg_delta_stats']['mean']:.4f} "
+            f"lambda_fuse={debug_info['lambda_fuse']:.4f} "
+            f"lambda_struct={debug_info['lambda_struct']:.4f} "
+            f"lambda_expr={debug_info['lambda_expr']:.4f} "
+            f"w_t={debug_info['aux_warmup']:.4f} "
+            f"delta_pos_mean={debug_info['pos_score_delta_stats']['mean']:.4f} "
+            f"delta_neg_mean={debug_info['neg_score_delta_stats']['mean']:.4f} "
             f"match={debug_info['match_loss']:.4f} "
             f"style={debug_info['style_neighbor_loss']:.4f} "
-            f"orth={debug_info['orth_loss']:.4f} final={debug_info['final_loss']:.4f} "
+            f"orth={debug_info['orth_loss']:.4f} "
+            f"expr_rank={debug_info['expr_rank_loss']:.4f} "
+            f"final={debug_info['final_loss']:.4f} "
             f"valid_style_pairs={debug_info['style_neighbor_meta']['valid_style_neighbor_pairs']}/"
             f"{debug_info['style_neighbor_meta']['total_positive_samples']}"
         )
@@ -808,11 +1189,32 @@ class StructuredPLModel(pl.LightningModule):
         logger.info("[DebugTrain] " + self._format_stats_line("pos_a", debug_info["pos_a_stats"]))
         logger.info(
             "[DebugTrain] "
+            + self._format_stats_line("pos_base_score", debug_info["pos_base_score_stats"])
+        )
+        logger.info(
+            "[DebugTrain] "
             + self._format_stats_line("pos_style_score", debug_info["pos_style_score_stats"])
         )
         logger.info(
             "[DebugTrain] "
             + self._format_stats_line("pos_expr_score", debug_info["pos_expr_score_stats"])
+        )
+        logger.info(
+            "[DebugTrain] "
+            + self._format_stats_line("pos_style_gate", debug_info["pos_style_gate_stats"])
+        )
+        logger.info(
+            "[DebugTrain] "
+            + self._format_stats_line("pos_expr_mod", debug_info["pos_expr_mod_stats"])
+        )
+        logger.info(
+            "[DebugTrain] "
+            f"pos_style_score_mean={debug_info['pos_style_score_mean']:.4f} "
+            f"neg_style_score_mean={debug_info['neg_style_score_mean']:.4f} "
+            f"pos_expr_score_mean={debug_info['pos_expr_score_mean']:.4f} "
+            f"neg_expr_score_mean={debug_info['neg_expr_score_mean']:.4f} "
+            f"pos_style_gate_mean={debug_info['pos_style_gate_mean']:.4f} "
+            f"neg_style_gate_mean={debug_info['neg_style_gate_mean']:.4f}"
         )
         if debug_info["style_neighbor_meta"]["missing_neighbor_img_ids"]:
             logger.info(
@@ -831,6 +1233,8 @@ class StructuredPLModel(pl.LightningModule):
             attention_mask=batch["attention_mask"],
             img_ids=batch["img_ids"],
             neg_img_ids=batch["neg_img_ids"],
+            global_step=int(self.global_step),
+            total_steps=int(self.num_training_steps),
         )
 
     def run_eval_batch(
@@ -862,19 +1266,134 @@ class StructuredPLModel(pl.LightningModule):
         reciprocal_rank = 1.0 / (idx + 1)
         return torch.sum(reciprocal_rank), labels.size(0)
 
+    def on_train_start(self) -> None:
+        """One-time legend for tqdm + [MatchScoreDecomp] fields (see train.log if terminal wraps)."""
+        sys.stderr.write("\n")
+        logger.info(
+            "[TrainMetricsLegend] Match objective uses fused score s_final (per sample): "
+            "s_base = BERT logit margin (pos class - neg class); "
+            "structured_term from struct_fuse_mode (e.g. full => s_style + expr_mod); "
+            "s_final = s_base + lambda_fuse * structured_term (unless base_only)."
+        )
+        logger.info(
+            "[TrainMetricsLegend] tqdm (compact): "
+            "total=full loss; match=CE on fused pos/neg logits; "
+            "s_b=EMA( mean|lambda_fuse*structured_term| / mean|s_base| ); "
+            "pm=EMA( mean(s_final_pos - s_final_neg) ). "
+            "Higher pm => on average positive sticker scores above negative in this batch."
+        )
+        logger.info(
+            "[TrainMetricsLegend] [MatchScoreDecomp] every train_score_decomp_log_interval steps: "
+            "instant batch stats (not EMA). "
+            "|s_base|~=mean abs s_base over pos+neg; "
+            "lambda|struct|~=mean abs(lambda_fuse*structured_term); "
+            "ratio~=lambda|struct|/|s_base|; "
+            "lambda|style| / lambda|expr_mod| split the structured term when mode=full. "
+            "Other losses (style neighbor, orth, expr rank) are aux; they shape embeddings, "
+            "not add directly into s_final."
+        )
+        if self.args.train_prog_bar_mode == "compact":
+            logger.info(
+                "[TrainMetricsLegend] style/orth/expr/saux/eaux/wt are logged to TensorBoard as "
+                "train_* only (compact bar). Use --train_prog_bar_mode full to show them on tqdm."
+            )
+        return super().on_train_start()
+
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         outputs = self.run_train_batch(batch)
-        style_w, expr_w = self.model.get_nonnegative_match_weights()
-        self.log("train_loss", outputs.loss)
-        self.log("train_match_loss", outputs.match_loss)
-        self.log("train_style_neighbor_loss", outputs.style_neighbor_loss)
-        self.log("train_orth_loss", outputs.orth_loss)
+        structured_aux = self.args.lambda_struct * (
+            outputs.style_neighbor_loss + outputs.orth_loss
+        )
+        expr_aux = self.args.lambda_expr * outputs.expr_rank_loss
         if self.args.base_only:
-            self.log("train_style_match_weight", torch.zeros_like(style_w))
-            self.log("train_expr_match_weight", torch.zeros_like(expr_w))
-        else:
-            self.log("train_style_match_weight", style_w)
-            self.log("train_expr_match_weight", expr_w)
+            structured_aux = structured_aux * 0.0
+            expr_aux = expr_aux * 0.0
+        weighted_struct_aux = outputs.aux_warmup * structured_aux
+        weighted_expr_aux = outputs.aux_warmup * expr_aux
+
+        self.log("train_loss", outputs.loss, prog_bar=False)
+        self.log("train_match_loss", outputs.match_loss, prog_bar=False)
+        self.log("train_style_neighbor_loss", outputs.style_neighbor_loss, prog_bar=False)
+        self.log("train_orth_loss", outputs.orth_loss, prog_bar=False)
+        self.log("train_expr_rank_loss", outputs.expr_rank_loss, prog_bar=False)
+        self.log("train_aux_warmup", outputs.aux_warmup, prog_bar=False)
+        self.log("train_structured_aux", weighted_struct_aux, prog_bar=False)
+        self.log("train_expr_aux", weighted_expr_aux, prog_bar=False)
+
+        # tqdm: default compact bar so narrow terminals still show score-decomp fields (s_b, pm).
+        # Full losses stay in train_* (TensorBoard). Use --train_prog_bar_mode full for the old bar.
+        _pb = self.args.train_prog_bar_mode == "full"
+        self.log("total", outputs.loss.detach(), prog_bar=True, logger=False)
+        self.log("match", outputs.match_loss.detach(), prog_bar=True, logger=False)
+        self.log("style", outputs.style_neighbor_loss.detach(), prog_bar=_pb, logger=False)
+        self.log("orth", outputs.orth_loss.detach(), prog_bar=_pb, logger=False)
+        self.log("expr", outputs.expr_rank_loss.detach(), prog_bar=_pb, logger=False)
+        self.log("saux", weighted_struct_aux.detach(), prog_bar=_pb, logger=False)
+        self.log("eaux", weighted_expr_aux.detach(), prog_bar=_pb, logger=False)
+        self.log("wt", outputs.aux_warmup.detach(), prog_bar=_pb, logger=False)
+
+        decomp = outputs.score_decomp
+        if decomp is not None:
+            a = 0.05
+            sb = decomp["struct_over_base"]
+            pm = decomp["rank_margin_mean"]
+            if self._match_score_sb_ema is None:
+                self._match_score_sb_ema = sb
+                self._match_score_margin_ema = pm
+            else:
+                self._match_score_sb_ema = a * sb + (1.0 - a) * self._match_score_sb_ema
+                self._match_score_margin_ema = a * pm + (1.0 - a) * self._match_score_margin_ema
+            dev = outputs.loss.device
+            self.log(
+                "s_b",
+                torch.tensor(self._match_score_sb_ema, device=dev, dtype=torch.float32),
+                prog_bar=True,
+                logger=False,
+            )
+            self.log(
+                "pm",
+                torch.tensor(self._match_score_margin_ema, device=dev, dtype=torch.float32),
+                prog_bar=True,
+                logger=False,
+            )
+
+        log_iv = int(self.args.train_score_decomp_log_interval or 0)
+        if (
+            log_iv > 0
+            and decomp is not None
+            and int(self.global_step) % log_iv == 0
+        ):
+            # Avoid glueing log lines to the tqdm carriage-return line.
+            sys.stderr.write("\n")
+            st = int(self.global_step)
+            if self.args.base_only:
+                logger.info("[MatchScoreDecomp] step=%d  (base_only: s_final = s_base)", st)
+                logger.info(
+                    "  |s_base|~%.4f  mean(s_pos-s_neg)~%.4f",
+                    decomp["base_mabs"],
+                    decomp["rank_margin_mean"],
+                )
+            else:
+                logger.info(
+                    "[MatchScoreDecomp] step=%d  s_final = s_base + lambda_fuse * (%s)",
+                    st,
+                    self.model.structured_term_formula(),
+                )
+                logger.info(
+                    "  lambda_fuse=%.3f  |s_base|~%.4f  lambda|struct|~%.4f  "
+                    "ratio~%.4f  mean(s_pos-s_neg)~%.4f",
+                    float(self.args.lambda_fuse),
+                    decomp["base_mabs"],
+                    decomp["lam_struct_mabs"],
+                    decomp["struct_over_base"],
+                    decomp["rank_margin_mean"],
+                )
+                logger.info(
+                    "  lambda|style|~%.4f  lambda|expr_mod|~%.4f",
+                    decomp["lam_style_mabs"],
+                    decomp["lam_expr_mod_mabs"],
+                )
+
         if self.args.debug_smoke_test and outputs.debug_info is not None:
             if self.args.debug_smoke_log_every_step:
                 self._log_debug_train_summary(outputs.debug_info, int(batch_idx))
@@ -883,15 +1402,30 @@ class StructuredPLModel(pl.LightningModule):
 
     def on_validation_epoch_start(self) -> None:
         self.model.prepare_for_test()
+        self._reset_eval_diagnostics()
+        if getattr(self, "_per_epoch_dual_test_eval", False):
+            self._eval_max_cand_pair = [0, 0]
+        else:
+            self._eval_max_cand_len = 0
         return super().on_validation_epoch_start()
 
     def on_test_epoch_start(self) -> None:
         self.model.prepare_for_test()
+        self._reset_eval_diagnostics()
+        if getattr(self, "_per_epoch_dual_test_eval", False):
+            self._eval_max_cand_pair = [0, 0]
+        else:
+            self._eval_max_cand_len = 0
         return super().on_test_epoch_start()
 
-    def validation_step(self, batch: Dict[str, Any], batch_idx: int):
-        if self.args.debug_smoke_test:
-            scores, labels, cands, eval_debug = self.run_eval_batch(batch, return_debug=True)
+    def validation_step(self, batch: Dict[str, Any], batch_idx: int, dataloader_idx: int = 0):
+        scores, labels, cands, eval_debug = self.run_eval_batch(batch, return_debug=True)
+        # Sanity check runs ~2 batches only; scale stats there are not comparable to full val.
+        tr = getattr(self, "trainer", None)
+        if tr is None or not getattr(tr, "sanity_checking", False):
+            if not getattr(self, "_per_epoch_dual_test_eval", False) or int(dataloader_idx) == 0:
+                self._update_eval_diagnostics(eval_debug)
+        if self.args.debug_smoke_test or self.args.debug_compare_base_only:
             logger.info(
                 "[DebugEval] "
                 f"batch_idx={batch_idx} uses_fused={eval_debug['uses_fused_logits_for_ranking']} "
@@ -902,8 +1436,14 @@ class StructuredPLModel(pl.LightningModule):
                 "[DebugEval] fused_minus_base_abs_mean="
                 f"{eval_debug['fused_minus_base_abs_mean']:.6f}"
             )
-        else:
-            scores, labels, cands = self.run_eval_batch(batch)
+            logger.info(
+                "[DebugEval] "
+                + self._format_stats_line("style_gate", eval_debug["style_gate_stats"])
+            )
+            logger.info(
+                "[DebugEval] "
+                + self._format_stats_line("expr_mod", eval_debug["expr_mod_stats"])
+            )
         _, idx = torch.sort(scores, dim=-1, descending=True)
 
         if cands is not None:
@@ -923,10 +1463,36 @@ class StructuredPLModel(pl.LightningModule):
         cor5, tot5 = self.compute_acc(idx, labels, 5)
         map_sum, map_tot = self.compute_map(idx, labels)
 
-        self.valtest_acc5.update(cor1, tot1)
-        self.valtest_acc30.update(cor2, tot2)
-        self.valtest_acc90.update(cor5, tot5)
-        self.valtest_map.update(map_sum, map_tot)
+        if getattr(self, "_per_epoch_dual_test_eval", False):
+            di = int(dataloader_idx)
+            b = self._eval_bundles[di]
+            b["acc5"].update(cor1, tot1)
+            b["acc30"].update(cor2, tot2)
+            b["acc90"].update(cor5, tot5)
+            b["map"].update(map_sum, map_tot)
+            if cands:
+                nc = len(cands)
+                self._eval_max_cand_pair[di] = max(self._eval_max_cand_pair[di], nc)
+                if nc >= 10:
+                    c10, t10 = self.compute_acc(idx, labels, 10)
+                    b["acc_r10"].update(c10, t10)
+                if nc >= 20:
+                    c20, t20 = self.compute_acc(idx, labels, 20)
+                    b["acc_r20"].update(c20, t20)
+        else:
+            self.valtest_acc5.update(cor1, tot1)
+            self.valtest_acc30.update(cor2, tot2)
+            self.valtest_acc90.update(cor5, tot5)
+            self.valtest_map.update(map_sum, map_tot)
+            if cands:
+                nc = len(cands)
+                self._eval_max_cand_len = max(self._eval_max_cand_len, nc)
+                if nc >= 10:
+                    c10, t10 = self.compute_acc(idx, labels, 10)
+                    self.valtest_acc_r10.update(c10, t10)
+                if nc >= 20:
+                    c20, t20 = self.compute_acc(idx, labels, 20)
+                    self.valtest_acc_r20.update(c20, t20)
 
         metrics = [
             (cor1 / tot1).item(),
@@ -937,19 +1503,79 @@ class StructuredPLModel(pl.LightningModule):
         return metrics, return_preds, return_label
 
     def test_step(self, batch: Dict[str, Any], batch_idx: int):
-        return self.validation_step(batch, batch_idx)
+        return self.validation_step(batch, batch_idx, 0)
+
+    def _structured_eval_epoch_log_and_reset_metrics(self) -> None:
+        if getattr(self, "_per_epoch_dual_test_eval", False):
+            for di, tag in enumerate(["test-R10", "test-R20"]):
+                b = self._eval_bundles[di]
+                if int(b["acc5"].total) == 0:
+                    for _k, m in b.items():
+                        m.reset()
+                    continue
+                nc = int(self._eval_max_cand_pair[di])
+                mode = eval_retrieval_mode_label(bool(self.args.test_with_cand), nc)
+                extra_r = ""
+                if int(b["acc_r10"].total) > 0:
+                    extra_r += f" r@10={b['acc_r10'].compute():.4f}"
+                if int(b["acc_r20"].total) > 0:
+                    extra_r += f" r@20={b['acc_r20'].compute():.4f}"
+                logger.info(
+                    f"\n[StructuredEval] epoch={self.current_epoch} split={tag} mode={mode} "
+                    f"total={b['acc5'].total} "
+                    f"r@1={b['acc5'].compute():.4f} r@2={b['acc30'].compute():.4f} "
+                    f"r@5={b['acc90'].compute():.4f}{extra_r} mrr={b['map'].compute():.4f}"
+                )
+                for _k, m in b.items():
+                    m.reset()
+        else:
+            eval_mode = eval_retrieval_mode_label(
+                bool(self.args.test_with_cand), int(self._eval_max_cand_len)
+            )
+            extra_r = ""
+            if int(self.valtest_acc_r10.total) > 0:
+                extra_r += f" r@10={self.valtest_acc_r10.compute():.4f}"
+            if int(self.valtest_acc_r20.total) > 0:
+                extra_r += f" r@20={self.valtest_acc_r20.compute():.4f}"
+            logger.info(
+                f"\n[StructuredEval] epoch={self.current_epoch} mode={eval_mode} total={self.valtest_acc5.total} "
+                f"r@1={self.valtest_acc5.compute():.4f} r@2={self.valtest_acc30.compute():.4f} "
+                f"r@5={self.valtest_acc90.compute():.4f}{extra_r} mrr={self.valtest_map.compute():.4f}"
+            )
+            self.valtest_acc5.reset()
+            self.valtest_acc30.reset()
+            self.valtest_acc90.reset()
+            self.valtest_acc_r10.reset()
+            self.valtest_acc_r20.reset()
+            self.valtest_map.reset()
 
     def on_validation_epoch_end(self) -> None:
-        eval_mode = "R10(candidates)" if self.args.test_with_cand else "Rall(all-stickers)"
-        logger.info(
-            f"\n[StructuredEval] epoch={self.current_epoch} mode={eval_mode} total={self.valtest_acc5.total} "
-            f"r@1={self.valtest_acc5.compute():.4f} r@2={self.valtest_acc30.compute():.4f} "
-            f"r@5={self.valtest_acc90.compute():.4f} mrr={self.valtest_map.compute():.4f}"
-        )
-        self.valtest_acc5.reset()
-        self.valtest_acc30.reset()
-        self.valtest_acc90.reset()
-        self.valtest_map.reset()
+        self._structured_eval_epoch_log_and_reset_metrics()
+        diag = self._eval_diagnostics_summary()
+        if diag:
+            logger.info(
+                "[StructuredScale] "
+                f"epoch={self.current_epoch} "
+                f"n_batches={self.eval_diag_count} "
+                f"base_std={diag['base_score_std']:.4f} "
+                f"style_std={diag['style_score_std']:.4f} "
+                f"expr_mod_std={diag['expr_mod_std']:.4f} "
+                f"struct_std={diag['structured_term_std']:.4f} "
+                f"scaled_struct_std={diag['scaled_structured_term_std']:.4f} "
+                f"struct/base={diag['struct_over_base_ratio']:.4f} "
+                f"delta_abs={diag['fused_minus_base_abs_mean']:.4f} "
+                f"top1_flip={diag['top1_flip_rate']:.4f}"
+            )
+        elif (
+            not getattr(self, "_per_epoch_dual_test_eval", False)
+            and int(self.valtest_acc5.total) > 0
+            and int(self.valtest_acc5.total) < 64
+        ):
+            logger.info(
+                "[StructuredScale] skipped (Lightning sanity check uses few batches; "
+                "scale line appears after full validation with n_batches≈val set size)"
+            )
+        self._reset_eval_diagnostics()
         return super().on_validation_epoch_end()
 
     def test_epoch_end(self, outputs):
@@ -1090,6 +1716,7 @@ def build_trainer(args: StructuredArguments, for_train: bool) -> pl.Trainer:
         "max_epochs": args.epochs,
         "accumulate_grad_batches": args.gradient_accumulation_steps,
         "default_root_dir": args.pl_root_dir,
+        "precision": int(getattr(args, "trainer_precision", 32) or 32),
     }
     if for_train:
         trainer_kwargs["callbacks"] = [ModelCheckpoint(save_top_k=-1, verbose=True)]
@@ -1163,7 +1790,14 @@ def run_debug_smoke_test(args: StructuredArguments) -> None:
         batch = move_batch_to_device(raw_batch, device)
         optimizer.zero_grad()
 
-        output = model.run_train_batch(batch)
+        output = model.model.forward_train_batch(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            img_ids=batch["img_ids"],
+            neg_img_ids=batch["neg_img_ids"],
+            global_step=step,
+            total_steps=max(1, args.debug_smoke_train_steps),
+        )
         debug_info = output.debug_info or {}
         loss = output.loss
         if torch.isnan(loss).any() or torch.isinf(loss).any():
@@ -1184,7 +1818,7 @@ def run_debug_smoke_test(args: StructuredArguments) -> None:
         if debug_info and args.debug_smoke_log_every_step:
             model._log_debug_train_summary(debug_info, step=step)
 
-        tracked_param = model.model.style_match_weight
+        tracked_param = next(model.model.style_gate_head.parameters())
         before = tracked_param.detach().clone()
 
         loss.backward()
@@ -1196,6 +1830,7 @@ def run_debug_smoke_test(args: StructuredArguments) -> None:
             "query_head": _module_grad_summary(model.model.query_head),
             "style_match_head": _module_grad_summary(model.model.style_match_head),
             "expr_match_head": _module_grad_summary(model.model.expr_match_head),
+            "style_gate_head": _module_grad_summary(model.model.style_gate_head),
             "bert_classifier_head": _module_grad_summary(model.model.bert.classifier),
             "bert_backbone_sample_layer0": _module_grad_summary(model.model.bert.bert.encoder.layer[0]),
             "bert_backbone_sample_layer_last": _module_grad_summary(model.model.bert.bert.encoder.layer[-1]),
@@ -1215,7 +1850,7 @@ def run_debug_smoke_test(args: StructuredArguments) -> None:
         after = tracked_param.detach().clone()
         param_delta = float((after - before).abs().mean().item())
         logger.info(
-            f"[DebugStepUpdate] step={step} style_match_weight_delta_abs_mean={param_delta:.8f} "
+            f"[DebugStepUpdate] step={step} tracked_param_delta_abs_mean={param_delta:.8f} "
             f"lr={scheduler.get_last_lr()[0]:.8e}"
         )
 
@@ -1228,7 +1863,7 @@ def run_debug_smoke_test(args: StructuredArguments) -> None:
             scores, labels, cands, eval_debug = model.run_eval_batch(
                 eval_batch, return_debug=True
             )
-            if eval_debug["uses_fused_logits_for_ranking"] is not True:
+            if (not args.base_only) and eval_debug["uses_fused_logits_for_ranking"] is not True:
                 raise ValueError("[DebugSmoke] evaluation does not use fused logits.")
             logger.info(
                 "[DebugSmokeEvalStep] "

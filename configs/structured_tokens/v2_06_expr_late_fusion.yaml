@@ -1,0 +1,7 @@
+# Optional hybrid: early expr tokens PLUS late scalar fusion (old structured_term on top).
+extends: _base.yaml
+name: v2_06_expr_late_fusion
+description: "Expr token injection + struct_token_use_late_fusion=true (rank uses base+fused struct)."
+struct_token_mode: expr
+struct_token_use_late_fusion: true
+pl_root_dir: logs/structured_tokens_v2_06_expr_late_fuse

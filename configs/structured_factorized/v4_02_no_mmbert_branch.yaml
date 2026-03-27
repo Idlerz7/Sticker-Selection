@@ -1,0 +1,5 @@
+extends: _base.yaml
+name: v4_02_no_mmbert_branch
+description: "Ablation without MM-BERT candidate-branch recall; fusion still sees MM-BERT scores."
+pl_root_dir: logs/structured_factorized_v4_02_no_mmbert_branch
+factorized_use_mmbert_branch: false

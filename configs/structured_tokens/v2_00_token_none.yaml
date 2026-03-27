@@ -1,0 +1,6 @@
+# Ablate: no extra structured tokens → sequence matches legacy MM-BERT layout (control).
+extends: _base.yaml
+name: v2_00_token_none
+description: "No struct tokens; same losses as structured path but backbone input unchanged vs injecting tokens."
+struct_token_mode: none
+pl_root_dir: logs/structured_tokens_v2_00_none

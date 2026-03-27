@@ -1,0 +1,5 @@
+extends: _base.yaml
+name: v3_01_expr_residual
+description: "Add projected expr residual onto the legacy sticker token; no late fusion."
+struct_residual_mode: expr
+pl_root_dir: logs/structured_residual_v3_01_expr

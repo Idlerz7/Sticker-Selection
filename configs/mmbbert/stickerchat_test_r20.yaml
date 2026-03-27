@@ -1,0 +1,5 @@
+extends: _stickerchat_base.yaml
+name: stickerchat_test_r20
+description: "Same as StickerChat MM-BERT base but test on fixed R20 candidates (run test/gen with this config)."
+mode: test
+test_data_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r20.json

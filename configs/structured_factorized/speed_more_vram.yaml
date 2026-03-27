@@ -1,0 +1,13 @@
+# Merge after your experiment yaml.
+# - factorized_fused_train_mmbert: true → one fused MM-BERT forward at batch 3×micro_batch (optional speed overlay).
+#   (otherwise 3× MM-BERT). bert_gradient_checkpointing still recommended for large micro-batches.
+# - Raise train_batch_size while VRAM allows; OOM -> try 48, then 32.
+# - Effective batch = train_batch_size × gradient_accumulation_steps (here 64×1).
+#   If you double it vs an old 32 run, consider scaling learning rate (e.g. linear sqrt rule).
+#
+# Example:
+#   python main_structured_factorized.py --config configs/structured_factorized/v4_01_style_expr_two_stage.yaml configs/structured_factorized/speed_more_vram.yaml
+
+bert_gradient_checkpointing: true
+train_batch_size: 32
+gradient_accumulation_steps: 1

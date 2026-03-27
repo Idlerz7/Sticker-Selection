@@ -1,0 +1,6 @@
+extends: _base.yaml
+name: v3_03_expr_residual_qgate
+description: "Expr residual sticker modulation with query-conditioned per-dimension gating."
+struct_residual_mode: expr
+residual_condition_mode: query_gate
+pl_root_dir: logs/structured_residual_v3_03_expr_qgate

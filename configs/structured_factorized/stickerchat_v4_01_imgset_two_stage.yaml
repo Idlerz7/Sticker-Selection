@@ -1,0 +1,4 @@
+extends: stickerchat_base.yaml
+name: stickerchat_v4_01_imgset_two_stage
+description: "Full StickerChat factorized run using known img_set style prototypes."
+pl_root_dir: logs/stickerchat_factorized_v4_01

@@ -1,0 +1,6 @@
+# Phase 1: expression component only as extra BERT token(s).
+extends: _base.yaml
+name: v2_01_expr
+description: "Inject expr token (from decomposed `a`) before SEP; rank by backbone score only."
+struct_token_mode: expr
+pl_root_dir: logs/structured_tokens_v2_01_expr

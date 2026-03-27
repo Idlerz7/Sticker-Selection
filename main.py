@@ -363,16 +363,22 @@ class UserVisualFusion(torch.nn.Module):
         return gate * user_pref + (1.0 - gate) * visual_pref
 
 
+def _hf_clip_pil_rgb(img):
+    """Pickle-friendly RGB convert for HF CLIP torchvision Compose (DataLoader workers)."""
+    return img.convert('RGB')
+
+
 class HFClipSentenceEncoder(torch.nn.Module):
     """本地 HuggingFace CLIP 的回退编码器封装。"""
 
-    def __init__(self, model_path, local_files_only=True):
+    def __init__(self, model_path, local_files_only=True, device=None):
         """
         初始化 HF-CLIP 编码器，当 `SentenceTransformer` 路径加载失败时作为回退方案。
 
         输入：
         - model_path (str): 本地 CLIP checkpoint 路径。
         - local_files_only (bool): 是否严格离线加载。
+        - device (Optional[str|torch.device]): 强制设备；默认 cuda（若可用）否则 cpu。
 
         输出：
         - 无显式返回值（构造函数）。
@@ -391,15 +397,22 @@ class HFClipSentenceEncoder(torch.nn.Module):
             resolved_model_path, local_files_only=local_files_only)
         self.processor = CLIPProcessor.from_pretrained(
             resolved_model_path, local_files_only=local_files_only)
-        self._target_device = torch.device(
-            'cuda' if torch.cuda.is_available() else 'cpu')
+        if device is not None:
+            self._target_device = torch.device(device)
+        else:
+            self._target_device = torch.device(
+                'cuda' if torch.cuda.is_available() else 'cpu')
+        if self._target_device.type == 'cuda' and not torch.cuda.is_available():
+            raise RuntimeError(
+                f'HFClipSentenceEncoder requested {self._target_device} but torch.cuda.is_available() is False '
+                '(install CUDA build of PyTorch, or pass device=cpu).')
         self.model.to(self._target_device)
         # Use torchvision preprocessing directly to avoid the slow
         # "list of numpy.ndarrays -> tensor" path in transformers feature extractor.
         self.preprocess = Compose([
             Resize(224, interpolation=Image.BICUBIC),
             CenterCrop(224),
-            lambda img: img.convert("RGB"),
+            _hf_clip_pil_rgb,
             ToTensor(),
             Normalize((0.48145466, 0.4578275, 0.40821073),
                       (0.26862954, 0.26130258, 0.27577711)),
@@ -466,13 +479,18 @@ class HFClipSentenceEncoder(torch.nn.Module):
         txt_embs = None
         if 'pixel_values' in features:
             with torch.no_grad():
-                img_embs = self.model.get_image_features(
-                    pixel_values=features['pixel_values'])
+                pv = features['pixel_values'].to(
+                    self._target_device, non_blocking=True)
+                img_embs = self.model.get_image_features(pixel_values=pv)
         if 'input_ids' in features:
             with torch.no_grad():
+                ids = features['input_ids'].to(
+                    self._target_device, non_blocking=True)
+                mask = features.get('attention_mask')
+                if mask is not None:
+                    mask = mask.to(self._target_device, non_blocking=True)
                 txt_embs = self.model.get_text_features(
-                    input_ids=features['input_ids'],
-                    attention_mask=features.get('attention_mask'))
+                    input_ids=ids, attention_mask=mask)
 
         img_i, txt_i = 0, 0
         for input_type in features['image_text_info']:
@@ -1460,17 +1478,20 @@ class Model(torch.nn.Module):
             img_emb = self.get_emb_by_imgids(img_ids)
             neg_img_emb = self.get_emb_by_imgids(neg_img_ids)
         else:
-            # 测试路径：一次前向对“候选集合”打分。
-            # - cands 不为空：R10（10候选）
-            # - cands 为空：Rall（全贴纸候选）
-            if cands:
-                assert len(cands) == 1
-                cands = cands[0]
-                img_emb = self.all_img_embs[cands]
+            # 测试路径：一次前向对候选集合打分（assert batch_size==1 见下）。
+            # - 非空 cand_ids：R10/R20（仅对 these ids 取 all_img_embs）
+            # - 无候选且未强制候选评测：Rall（全库，显存极大）
+            # 注意：collate 可能产生 cands=[[]]（JSON 里 cand: []）。旧代码 `if cands:` 为真，
+            # 取 cands[0] 后空列表在下一分支被当成 falsy，误走 Rall，一次性 BERT batch≈max_image_id → OOM。
+            cand_ids = None
+            if cands is not None:
+                assert len(cands) == 1, "val/test ranking expects batch_size==1"
+                cand_ids = cands[0]
+            if cand_ids is not None and len(cand_ids) > 0:
+                img_emb = self.all_img_embs[cand_ids]
                 if self.args.add_ocr_info:
                     cls_inputs_ts = []
-
-                    for img_id in cands:
+                    for img_id in cand_ids:
                         mask_predict_inputs, mask_predict_outputs, cls_inputs = self.get_input_output_imglabel_by_imgid(
                             img_id)
                         cls_inputs_ts.append(cls_inputs)
@@ -1478,11 +1499,18 @@ class Model(torch.nn.Module):
                         cls_inputs_ts, device=self.all_img_embs.device, dtype=torch.long)
                     cls_inputs_emb = self.bert.bert.embeddings.word_embeddings(
                         cls_inputs_ts)
+                cands_ret = cand_ids
             else:
+                if getattr(self.args, "candidate_eval_only", False) or self.args.test_with_cand:
+                    raise ValueError(
+                        "Eval batch has missing or empty `cand` while candidate_eval_only/test_with_cand "
+                        "is set. Falling back to full-bank ranking would run MM-BERT on ~max_image_id "
+                        "candidates and typically CUDA OOM. Fix data: non-empty cand in JSON, or valid "
+                        "neg_img_id so PLDataset can build a local candidate list."
+                    )
                 img_emb = self.all_img_embs
                 if self.args.add_ocr_info:
                     cls_inputs_ts = []
-
                     for img_id in range(self.args.max_image_id):
                         mask_predict_inputs, mask_predict_outputs, cls_inputs = self.get_input_output_imglabel_by_imgid(
                             img_id)
@@ -1491,6 +1519,7 @@ class Model(torch.nn.Module):
                         cls_inputs_ts, device=self.all_img_embs.device, dtype=torch.long)
                     cls_inputs_emb = self.bert.bert.embeddings.word_embeddings(
                         cls_inputs_ts)
+                cands_ret = None
         # logger.info(f'unique img ids num:{len(list(set(img_ids)))}')
 
         if not test:
@@ -1806,7 +1835,7 @@ class Model(torch.nn.Module):
             # logger.debug(res.logits.size())
             logits = res.logits[:, 1].unsqueeze(0)
             labels = torch.tensor(img_ids, dtype=torch.long, device=device)
-            return logits, labels, cands
+            return logits, labels, cands_ret
 
     def prepare_imgs(self, args):
         """
@@ -2166,11 +2195,26 @@ class PLDataLoader(pl.LightningDataModule):
             n_train = len(self.train_dataset)
             logger.info(f"train samples={n_train}, train_batch_size={self.train_batch_size}, "
                         f"steps_per_epoch={max(1, (n_train + self.train_batch_size - 1) // self.train_batch_size)}")
-            if self.args.val_data_path:
+            pe10 = (getattr(self.args, 'per_epoch_eval_test_r10_path', None) or '').strip()
+            pe20 = (getattr(self.args, 'per_epoch_eval_test_r20_path', None) or '').strip()
+            if pe10 and pe20:
+                self.val_dataset_r10 = PLDataset(
+                    pe10, self.args.mode, self.args, self.tokenizer)
+                self.val_dataset_r20 = PLDataset(
+                    pe20, self.args.mode, self.args, self.tokenizer)
+                self._per_epoch_dual_val_loaders = True
+                logger.info(
+                    'per-epoch eval: test R10 (%d) + test R20 (%d) — no val split',
+                    len(self.val_dataset_r10),
+                    len(self.val_dataset_r20),
+                )
+            elif self.args.val_data_path:
+                self._per_epoch_dual_val_loaders = False
                 self.val_dataset = PLDataset(
                     self.val_data_path, self.args.mode, self.args, self.tokenizer)
                 logger.info('has val!')
             else:
+                self._per_epoch_dual_val_loaders = False
                 logger.info('no val!')
             logger.info('finish get data')
 
@@ -2211,7 +2255,7 @@ class PLDataLoader(pl.LightningDataModule):
         # neg_img_words = [d['neg_img_word'] for d in batch]
         neg_img_ids = [d['neg_img_id'] for d in batch]
         user_ids = [d['user_id'] for d in batch]
-        chunk = 490
+        chunk = int(getattr(self.args, 'max_dialogue_length', None) or 490)
         res = self.tokenizer(sents, return_tensors='pt',
                              padding=True, truncation=True, max_length=chunk)
         input_ids = res['input_ids']
@@ -2300,6 +2344,25 @@ class PLDataLoader(pl.LightningDataModule):
         - Optional[DataLoader]: 有验证集则返回迭代器，否则返回 None。
         """
         # return None
+        if getattr(self, '_per_epoch_dual_val_loaders', False):
+            return [
+                DataLoader(
+                    self.val_dataset_r10,
+                    batch_size=self.valtest_batch_size,
+                    num_workers=self.args.num_workers,
+                    pin_memory=True,
+                    shuffle=False,
+                    collate_fn=self.collate_fn,
+                ),
+                DataLoader(
+                    self.val_dataset_r20,
+                    batch_size=self.valtest_batch_size,
+                    num_workers=self.args.num_workers,
+                    pin_memory=True,
+                    shuffle=False,
+                    collate_fn=self.collate_fn,
+                ),
+            ]
         if self.args.val_data_path:
             return DataLoader(self.val_dataset,
                               batch_size=self.valtest_batch_size,
@@ -2327,6 +2390,39 @@ class PLDataLoader(pl.LightningDataModule):
                           pin_memory=True,
                           shuffle=False,
                           collate_fn=self.collate_fn)
+
+
+def _candidate_eval_mode_label(test_with_cand: bool, max_cand_len: int) -> str:
+    if not test_with_cand:
+        return "Rall(all-stickers)"
+    if max_cand_len > 0:
+        return f"R{max_cand_len}(candidates)"
+    return "Rcand(candidates)"
+
+
+def _pl_new_eval_metric_bundle():
+    return {
+        'acc5': MyAccuracy(),
+        'acc30': MyAccuracy(),
+        'acc90': MyAccuracy(),
+        'acc_r10': MyAccuracy(),
+        'acc_r20': MyAccuracy(),
+        'map': MyAccuracy(),
+    }
+
+
+def _pl_attach_per_epoch_dual_test_eval(pl_model, args):
+    p10 = (getattr(args, 'per_epoch_eval_test_r10_path', None) or '').strip()
+    p20 = (getattr(args, 'per_epoch_eval_test_r20_path', None) or '').strip()
+    pl_model._per_epoch_dual_test_eval = bool(p10 and p20)
+    if pl_model._per_epoch_dual_test_eval:
+        pl_model._eval_bundles = (
+            _pl_new_eval_metric_bundle(),
+            _pl_new_eval_metric_bundle(),
+        )
+        pl_model._eval_max_cand_pair = [0, 0]
+    else:
+        pl_model._eval_bundles = None
 
 
 class PLModel(pl.LightningModule):
@@ -2366,7 +2462,11 @@ class PLModel(pl.LightningModule):
         self.valtest_acc5 = MyAccuracy()
         self.valtest_acc30 = MyAccuracy()
         self.valtest_acc90 = MyAccuracy()
+        self.valtest_acc_r10 = MyAccuracy()
+        self.valtest_acc_r20 = MyAccuracy()
         self.valtest_map = MyAccuracy()
+        self._eval_max_cand_len = 0
+        _pl_attach_per_epoch_dual_test_eval(self, args)
         self.args = args
         self.model.prepare_imgs(args)
         self.id2name = {}
@@ -2528,6 +2628,10 @@ class PLModel(pl.LightningModule):
         """
         # if self.args.val_data_path:
         self.model.prepare_for_test()
+        if getattr(self, '_per_epoch_dual_test_eval', False):
+            self._eval_max_cand_pair = [0, 0]
+        else:
+            self._eval_max_cand_len = 0
         return super().on_validation_epoch_start()
 
     def log_res(self, batch, sorted_idx, batch_idx, k=5):
@@ -2561,7 +2665,7 @@ class PLModel(pl.LightningModule):
         logger.info(
             f"input_text:{input_text}, label:{label_text}, topk_text:{topk_text}, batch_idx:{batch_idx}")
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """
         验证/测试单步：完成候选打分、排序与指标更新。
 
@@ -2609,6 +2713,8 @@ class PLModel(pl.LightningModule):
                     labels[0] = i
                     # logger.debug(f'label after mapping:{i}')
                     break
+            if not getattr(self, '_per_epoch_dual_test_eval', False):
+                self._eval_max_cand_len = max(self._eval_max_cand_len, len(cands))
 
         topks = [1, 2, 5] if not self.args.test_with_cand else [1, 2, 5]
         # self.valtest_acc5.update(*self.compute_acc(idx, labels, topks[0]))
@@ -2619,11 +2725,80 @@ class PLModel(pl.LightningModule):
         cor2, tot2 = self.compute_acc(idx, labels, topks[1])
         cor5, tot5 = self.compute_acc(idx, labels, topks[2])
         cor, tot = self.compute_map(idx, labels)
-        self.valtest_acc5.update(cor1, tot1)
-        self.valtest_acc30.update(cor2, tot2)
-        self.valtest_acc90.update(cor5, tot5)
-        self.valtest_map.update(cor, tot)
+        if getattr(self, '_per_epoch_dual_test_eval', False):
+            di = int(dataloader_idx)
+            b = self._eval_bundles[di]
+            b['acc5'].update(cor1, tot1)
+            b['acc30'].update(cor2, tot2)
+            b['acc90'].update(cor5, tot5)
+            b['map'].update(cor, tot)
+            if cands:
+                nc = len(cands)
+                self._eval_max_cand_pair[di] = max(self._eval_max_cand_pair[di], nc)
+                if nc >= 10:
+                    c10, t10 = self.compute_acc(idx, labels, 10)
+                    b['acc_r10'].update(c10, t10)
+                if nc >= 20:
+                    c20, t20 = self.compute_acc(idx, labels, 20)
+                    b['acc_r20'].update(c20, t20)
+        else:
+            self.valtest_acc5.update(cor1, tot1)
+            self.valtest_acc30.update(cor2, tot2)
+            self.valtest_acc90.update(cor5, tot5)
+            self.valtest_map.update(cor, tot)
+            if cands:
+                nc = len(cands)
+                if nc >= 10:
+                    c10, t10 = self.compute_acc(idx, labels, 10)
+                    self.valtest_acc_r10.update(c10, t10)
+                if nc >= 20:
+                    c20, t20 = self.compute_acc(idx, labels, 20)
+                    self.valtest_acc_r20.update(c20, t20)
         return [(cor1 / tot1).item(), (cor2 / tot2).item(), (cor5 / tot5).item(), (cor / tot).item()], return_preds, return_labels
+
+    def _pl_eval_epoch_log_and_reset_metrics(self) -> None:
+        if getattr(self, '_per_epoch_dual_test_eval', False):
+            for di, tag in enumerate(['test-R10', 'test-R20']):
+                b = self._eval_bundles[di]
+                if int(b['acc5'].total) == 0:
+                    for _k, m in b.items():
+                        m.reset()
+                    continue
+                nc = int(self._eval_max_cand_pair[di])
+                mode = _candidate_eval_mode_label(bool(self.args.test_with_cand), nc)
+                extra_r = ''
+                if int(b['acc_r10'].total) > 0:
+                    extra_r += f" r@10={b['acc_r10'].compute():.4f}"
+                if int(b['acc_r20'].total) > 0:
+                    extra_r += f" r@20={b['acc_r20'].compute():.4f}"
+                logger.info(
+                    f"\n[EvalSummary] epoch={self.current_epoch} split={tag} mode={mode} "
+                    f"total={b['acc5'].total} "
+                    f"r@1={b['acc5'].compute():.4f} r@2={b['acc30'].compute():.4f} "
+                    f"r@5={b['acc90'].compute():.4f}{extra_r} mrr={b['map'].compute():.4f}"
+                )
+                for _k, m in b.items():
+                    m.reset()
+        else:
+            eval_mode = _candidate_eval_mode_label(
+                bool(self.args.test_with_cand), int(self._eval_max_cand_len)
+            )
+            extra_r = ''
+            if int(self.valtest_acc_r10.total) > 0:
+                extra_r += f" r@10={self.valtest_acc_r10.compute():.4f}"
+            if int(self.valtest_acc_r20.total) > 0:
+                extra_r += f" r@20={self.valtest_acc_r20.compute():.4f}"
+            logger.info(
+                f"\n[EvalSummary] epoch={self.current_epoch} mode={eval_mode} total={self.valtest_acc5.total} "
+                f"r@1={self.valtest_acc5.compute():.4f} r@2={self.valtest_acc30.compute():.4f} "
+                f"r@5={self.valtest_acc90.compute():.4f}{extra_r} mrr={self.valtest_map.compute():.4f}"
+            )
+            self.valtest_acc5.reset()
+            self.valtest_acc30.reset()
+            self.valtest_acc90.reset()
+            self.valtest_acc_r10.reset()
+            self.valtest_acc_r20.reset()
+            self.valtest_map.reset()
 
     def on_validation_epoch_end(self) -> None:
         """
@@ -2642,16 +2817,7 @@ class PLModel(pl.LightningModule):
                 json.dump(self.model.predict_id2ocr, f,
                           indent=2, ensure_ascii=False)
             return
-        eval_mode = "R10(candidates)" if self.args.test_with_cand else "Rall(all-stickers)"
-        logger.info(
-            f"\n[EvalSummary] epoch={self.current_epoch} mode={eval_mode} total={self.valtest_acc5.total} "
-            f"r@1={self.valtest_acc5.compute():.4f} r@2={self.valtest_acc30.compute():.4f} "
-            f"r@5={self.valtest_acc90.compute():.4f} mrr={self.valtest_map.compute():.4f}"
-        )
-        self.valtest_acc5.reset()
-        self.valtest_acc30.reset()
-        self.valtest_acc90.reset()
-        self.valtest_map.reset()
+        self._pl_eval_epoch_log_and_reset_metrics()
         return super().on_validation_epoch_end()
 
     def on_test_epoch_start(self) -> None:
@@ -2665,6 +2831,10 @@ class PLModel(pl.LightningModule):
         - 父类回调返回值。
         """
         self.model.prepare_for_test()
+        if getattr(self, '_per_epoch_dual_test_eval', False):
+            self._eval_max_cand_pair = [0, 0]
+        else:
+            self._eval_max_cand_len = 0
         return super().on_test_epoch_start()
 
     def test_step(self, batch, batch_idx):
@@ -2678,7 +2848,7 @@ class PLModel(pl.LightningModule):
         输出：
         - 与 `validation_step` 相同。
         """
-        return self.validation_step(batch, batch_idx)
+        return self.validation_step(batch, batch_idx, 0)
 
     def test_epoch_end(self, outputs):
         """
@@ -3008,7 +3178,30 @@ class Arguments:
     init_temp: Optional[float] = field(default=np.log(1/0.07))
     sent_num: Optional[int] = field(default=1)
     num_workers: Optional[int] = field(default=32)
+    max_dialogue_length: Optional[int] = field(
+        default=490,
+        metadata={
+            'help': 'Tokenizer truncation max_length for dialogue in collate_fn; '
+            'also used for mask_context_* tail slice when present.'
+        },
+    )
     test_with_cand: Optional[bool] = field(default=False)
+    candidate_eval_only: Optional[bool] = field(
+        default=False,
+        metadata={
+            'help': 'If True, force test_with_cand=True (e.g. StickerChat: fixed R10/R20, no Rall).'
+        },
+    )
+    per_epoch_eval_test_r10_path: Optional[str] = field(
+        default='',
+        metadata={
+            'help': 'If set with per_epoch_eval_test_r20_path, each train epoch validates on both test files (no val).'
+        },
+    )
+    per_epoch_eval_test_r20_path: Optional[str] = field(
+        default='',
+        metadata={'help': 'Companion to per_epoch_eval_test_r10_path for dual test-set eval each epoch.'},
+    )
     use_visual_personalization_token: Optional[bool] = field(default=False)
     use_visual_history_attention: Optional[bool] = field(default=True)
     visual_history_max_len: Optional[int] = field(default=50)
@@ -3052,24 +3245,27 @@ class Arguments:
         # if self.add_predict_img_label_task is True:
         #     assert self.add_ocr_info is True
         if self.ckpt_path and os.path.exists(self.ckpt_path):
-            names = os.listdir(self.ckpt_path)
-            if len(names) == 1:
-                self.ckpt_path = os.path.join(self.ckpt_path, names[0])
-            elif len(names) > 1:
-                # 支持“目录 + epoch”方式选 ckpt：
-                # --ckpt_path 指向目录，--ckpt_epoch 指定 epoch=N 的文件。
-                # 这样测试命令更稳定，避免手工拼完整文件名。
-                if(self.ckpt_epoch == -1):
-                    raise Exception(
-                        "More than 1 checkpoint but ckpt_epoch is -1")
-                for name in names:
-                    if f'epoch={self.ckpt_epoch}-' in name:
-                        self.ckpt_path = os.path.join(self.ckpt_path, name)
-                        break
+            if os.path.isfile(self.ckpt_path):
+                logger.info(f'real ckpt_path:{self.ckpt_path}')
             else:
-                raise Exception(f'No checkpoints in {self.ckpt_path}')
+                names = os.listdir(self.ckpt_path)
+                if len(names) == 1:
+                    self.ckpt_path = os.path.join(self.ckpt_path, names[0])
+                elif len(names) > 1:
+                    # 支持“目录 + epoch”方式选 ckpt：
+                    # --ckpt_path 指向目录，--ckpt_epoch 指定 epoch=N 的文件。
+                    # 这样测试命令更稳定，避免手工拼完整文件名。
+                    if(self.ckpt_epoch == -1):
+                        raise Exception(
+                            "More than 1 checkpoint but ckpt_epoch is -1")
+                    for name in names:
+                        if f'epoch={self.ckpt_epoch}-' in name:
+                            self.ckpt_path = os.path.join(self.ckpt_path, name)
+                            break
+                else:
+                    raise Exception(f'No checkpoints in {self.ckpt_path}')
 
-            logger.info(f'real ckpt_path:{self.ckpt_path}')
+                logger.info(f'real ckpt_path:{self.ckpt_path}')
         if self.speaker_token_max_id is None:
             self.speaker_token_max_id = 2
         if self.speaker_token_max_id < 2:
@@ -3077,6 +3273,13 @@ class Arguments:
         # Auto-enable R10 when vocab is large (avoids scoring over 30k+ candidates)
         if self.max_image_id and self.max_image_id > 1000:
             self.test_with_cand = True
+        if getattr(self, 'candidate_eval_only', False):
+            self.test_with_cand = True
+        if self.mode in ('train', 'pretrain'):
+            p10 = (getattr(self, 'per_epoch_eval_test_r10_path', None) or '').strip()
+            p20 = (getattr(self, 'per_epoch_eval_test_r20_path', None) or '').strip()
+            if p10 and p20:
+                self.val_data_path = ''
 
 
 def main(args):

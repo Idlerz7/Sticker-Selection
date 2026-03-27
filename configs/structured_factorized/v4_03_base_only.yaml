@@ -1,0 +1,5 @@
+extends: _base.yaml
+name: v4_03_base_only
+description: "Ablation that keeps the factorized diagnostics but ranks by MM-BERT base score only."
+pl_root_dir: logs/structured_factorized_v4_03_base_only
+base_only: true

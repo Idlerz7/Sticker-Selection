@@ -1,0 +1,27 @@
+# Merge after a StickerChat experiment yaml.
+# Example:
+#   python main_structured_factorized.py \
+#     --config configs/structured_factorized/stickerchat_v4_01_imgset_two_stage.yaml \
+#              configs/structured_factorized/stickerchat_speed_more_vram.yaml
+#
+# Fused MM-BERT (batch=3×micro_batch on one forward): same FLOPs as 3 separate forwards but
+# higher peak activation memory — unsafe with gradient_checkpointing off on large micro-batches.
+#
+# - bert_gradient_checkpointing: true — recommended; keeps training stable on ~80GB @ batch 64.
+#   To try false for speed, first set factorized_fused_train_mmbert: false and/or train_batch_size≤32.
+# - factorized_fused_train_mmbert: false — lower peak VRAM on MM-BERT pass (3× batch=B vs 1× batch=3B).
+# - factorized_train_mmbert_two_way: true — optional ~33% fewer MM-BERT forwards (see structured_retrieval_factorized).
+# - factorized_train_bank_refresh_steps: larger → fewer full-bank decompose spikes.
+#
+# On A800-class cards, prefer a larger micro-batch so the fixed full-bank
+# factorization cost is amortized over fewer train iterations.
+
+train_batch_size: 64
+gradient_accumulation_steps: 1
+factorized_fused_train_mmbert: false
+factorized_train_bank_refresh_steps: 500
+bert_gradient_checkpointing: true
+trainer_precision: 16
+allow_tf32: true
+cudnn_benchmark: true
+num_workers: 16

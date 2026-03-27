@@ -1,0 +1,5 @@
+extends: _base.yaml
+name: v3_00_none
+description: "Residual baseline: keep the plain legacy sticker token, no struct residual applied."
+struct_residual_mode: none
+pl_root_dir: logs/structured_residual_v3_00_none

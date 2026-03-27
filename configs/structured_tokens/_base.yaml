@@ -1,0 +1,55 @@
+# Shared defaults for Structured Token V2 (main_structured_tokens.py).
+# Ablation YAMLs set `extends: _base.yaml` and only override experiment-specific fields.
+#
+# Run (example):
+#   python main_structured_tokens.py --config configs/structured_tokens/v2_01_expr.yaml
+# Multiple configs merge left → right; CLI flags after --config still override YAML.
+
+name: structured_tokens_base
+description: "Shared MM-BERT + structured training recipe (matches typical structured_dstc runs)."
+
+mode: train
+gpus: 1
+seed: 2021
+
+fix_img: true
+fix_text: false
+model_choice: use_img_clip
+local_files_only: true
+
+bert_pretrain_path: ./ckpt/bert-base-chinese
+img_pretrain_path: ./ckpt/clip-ViT-B-32
+text_clip_pretrain_path: ./ckpt/clip-ViT-B-32
+
+train_data_path: ./data/train_pair.json
+val_data_path: ./data/validation_pair.json
+test_data_path: ./data/validation_pair.json
+max_image_id: 307
+
+img_emb_cache_path: ./data/meme_set_clip_embs.pt
+
+style_neighbors_path: ./style_neighbors.json
+style_neighbor_topk: 5
+style_sampling_mode: random_topk
+expr_gate_mode: sigmoid
+struct_fuse_mode: full
+lambda_fuse: 3.0
+lambda_struct: 0.5
+
+train_batch_size: 32
+valtest_batch_size: 1
+num_workers: 8
+epochs: 10
+gradient_accumulation_steps: 1
+
+# V2 defaults (early injection; ranking score = backbone logit-derived score only)
+struct_token_mode: expr
+token_condition_mode: none
+struct_token_use_late_fusion: false
+struct_token_compare_plain_eval: true
+struct_token_log_interval: 200
+# When false and struct_token_mode != none: omit sticker_token (img_ff on CLIP); keep only struct token(s)+SEP.
+struct_token_include_sticker_token: true
+
+train_score_decomp_log_interval: 200
+train_prog_bar_mode: compact

@@ -1,0 +1,29 @@
+extends: _base.yaml
+name: stickerchat_factorized_base
+description: "StickerChat factorized retrieval using known img_set style groups."
+
+train_data_path: ./stickerchat/processed/release_train_u_sticker_format_int.json
+val_data_path: ""
+per_epoch_eval_test_r10_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json
+per_epoch_eval_test_r20_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r20.json
+test_data_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json
+
+id2img_path: ./stickerchat/processed/id2img.json
+id2name_path: ./stickerchat/processed/id2name.json
+ocr_path: ./stickerchat/processed/ocr.json
+img_dir: ./stickerchat/png_stickers_flat
+img_emb_cache_path: ./stickerchat/processed/stickerchat_clip_embs.pt
+
+max_image_id: 174695
+speaker_token_max_id: 32
+sent_num: 0
+test_with_cand: true
+candidate_eval_only: true
+
+style_neighbors_path: ./stickerchat/processed/style_neighbors.json
+factorized_bank_path: ./stickerchat/processed/factorized_style_bank.json
+factorized_bank_source: style_metadata
+factorized_style_metadata_path: ./stickerchat/processed/sticker_metadata.json
+
+prepare_batch_size: 256
+prepare_workers: 8

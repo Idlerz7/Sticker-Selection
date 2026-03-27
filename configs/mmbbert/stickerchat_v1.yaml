@@ -1,0 +1,4 @@
+extends: _stickerchat_base.yaml
+name: stickerchat_v1
+description: "Legacy MM-BERT baseline on StickerChat with remapped int ids."
+pl_root_dir: logs/stickerchat_mmbbert_v1

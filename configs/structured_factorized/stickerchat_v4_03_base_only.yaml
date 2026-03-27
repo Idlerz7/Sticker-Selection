@@ -1,0 +1,5 @@
+extends: stickerchat_base.yaml
+name: stickerchat_v4_03_base_only
+description: "StickerChat factorized ablation that ranks by MM-BERT base score only."
+pl_root_dir: logs/stickerchat_factorized_v4_03_base_only
+base_only: true
