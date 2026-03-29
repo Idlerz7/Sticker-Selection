@@ -2,6 +2,9 @@ import os
 import random
 # Work around protobuf C-extension segfault on some environments.
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
+import distutils_tensorboard_shim  # noqa: F401
+
 import time
 
 from logging import log
@@ -159,6 +162,39 @@ def attach_manual_log_file(args):
     ts = time.strftime('%Y%m%d-%H%M%S')
     log_file = os.path.join(args.pl_root_dir, 'manual_logs', f'{args.mode}-{ts}.log')
     attach_run_log_file(log_file, args=args)
+
+
+def save_final_checkpoint_from_trainer(trainer, args, filename: str = "final.ckpt") -> Optional[str]:
+    """
+    在训练结束后额外导出一个稳定命名的 checkpoint，便于脚本化评测复用。
+
+    输入：
+    - trainer: Lightning Trainer 实例。
+    - args: 当前运行参数，至少包含 `pl_root_dir`。
+    - filename (str): 导出文件名，默认 `final.ckpt`。
+
+    输出：
+    - Optional[str]: 导出后的 checkpoint 路径；若当前不是 global zero 进程则返回 None。
+    """
+    if not bool(getattr(trainer, "is_global_zero", True)):
+        return None
+
+    try:
+        log_dir = trainer.log_dir
+    except Exception as e:
+        logger.warning(
+            "trainer.log_dir unavailable after fit, fallback to root lightning_logs: %s", e
+        )
+        log_dir = None
+
+    if not log_dir:
+        log_dir = os.path.join(args.pl_root_dir, "lightning_logs")
+
+    try_create_dir(log_dir)
+    ckpt_path = os.path.join(log_dir, filename)
+    trainer.save_checkpoint(ckpt_path)
+    logger.info("[CheckpointExport] saved final checkpoint to %s", ckpt_path)
+    return ckpt_path
 
 
 class BertModel(BertForSequenceClassification):
@@ -3186,7 +3222,7 @@ class Arguments:
     max_emotion_id: Optional[int] = field(default=52)
     speaker_token_max_id: Optional[int] = field(default=2)
     init_temp: Optional[float] = field(default=np.log(1/0.07))
-    sent_num: Optional[int] = field(default=1)
+    sent_num: Optional[int] = field(default=0)
     num_workers: Optional[int] = field(default=32)
     max_dialogue_length: Optional[int] = field(
         default=490,
@@ -3344,6 +3380,7 @@ def main(args):
             default_root_dir=args.pl_root_dir)
         attach_version_log_from_trainer(args, trainer)
         trainer.fit(model, pld)
+        save_final_checkpoint_from_trainer(trainer, args)
     elif args.mode == 'test' or args.mode == 'gen':
         model = PLModel(args)
         ckpt = torch.load(args.ckpt_path, map_location="cpu")

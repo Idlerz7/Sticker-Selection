@@ -3,6 +3,8 @@ import os
 # Work around protobuf C-extension segfault in some environments.
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
+import distutils_tensorboard_shim  # noqa: F401
+
 from utils import try_create_dir
 from structured_retrieval import parse_structured_args, run_structured_main
 

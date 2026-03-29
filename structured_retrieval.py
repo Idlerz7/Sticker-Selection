@@ -10,12 +10,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 # (must be set before importing pytorch_lightning/tensorboard).
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
+import distutils_tensorboard_shim  # noqa: F401
+
 import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 import transformers
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.plugins import DDPPlugin
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
@@ -28,6 +31,7 @@ from main import (
     attach_test_log_to_ckpt_version,
     attach_version_log_from_trainer,
     logger,
+    save_final_checkpoint_from_trainer,
 )
 from metrics import MyAccuracy
 from utils import try_create_dir
@@ -158,9 +162,22 @@ class StructuredArguments(LegacyArguments):
     trainer_precision: Optional[int] = field(default=32)
     allow_tf32: Optional[bool] = field(default=True)
     cudnn_benchmark: Optional[bool] = field(default=True)
+    # Multiple BERT forwards per step (query + pair logits); checkpointing trades speed for VRAM.
+    bert_gradient_checkpointing: Optional[bool] = field(default=True)
+    # DDP only: None = PyTorch Lightning default (find_unused_parameters=True).
+    # False can be used with DdpStaticGraphCallback when that callback is enabled.
+    ddp_find_unused_parameters: Optional[bool] = field(default=None)
+    # DDP multi-GPU: if True, register DdpStaticGraphCallback (helps some PT+checkpoint builds).
+    # Default False: transformers 4.10 only sets config.gradient_checkpointing; combining static
+    # graph with that reentrant checkpoint can cause EngineBase.run_backward NULL — keep off unless needed.
+    ddp_static_graph_callback: Optional[bool] = field(default=False)
 
     def __post_init__(self):
         super().__post_init__()
+        if self.bert_gradient_checkpointing is None:
+            self.bert_gradient_checkpointing = True
+        if self.ddp_static_graph_callback is None:
+            self.ddp_static_graph_callback = False
         # Structured experiments explicitly disable all legacy personalization paths.
         self.use_visual_personalization_token = False
         self.use_visual_history_attention = False
@@ -394,6 +411,26 @@ class StructuredStickerModel(LegacyModel):
         self.loss_fct = nn.CrossEntropyLoss()
         self.neighbor_store = StyleNeighborStore.from_json(args.style_neighbors_path)
         self._neighbor_rng = random.Random(args.seed)
+        if getattr(args, "bert_gradient_checkpointing", True):
+            if hasattr(self.bert, "gradient_checkpointing_enable"):
+                try:
+                    self.bert.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False}
+                    )
+                    logger.info(
+                        "[Structured] BERT gradient checkpointing enabled "
+                        "(use_reentrant=False; lower VRAM; slower step)."
+                    )
+                except TypeError:
+                    self.bert.gradient_checkpointing_enable()
+                    logger.info(
+                        "[Structured] BERT gradient checkpointing enabled (lower VRAM; slower step)."
+                    )
+            else:
+                self.bert.config.gradient_checkpointing = True
+                logger.info(
+                    "[Structured] Set config.gradient_checkpointing=True on BERT."
+                )
 
     def get_emb_by_imgids(self, img_ids: Sequence[int]) -> torch.Tensor:
         """
@@ -532,6 +569,7 @@ class StructuredStickerModel(LegacyModel):
         attention_mask: torch.Tensor,
         img_emb: torch.Tensor,
         img_ids: Sequence[int],
+        dialogue_q: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = text_emb.device
         batch_size = img_emb.size(0)
@@ -650,6 +688,7 @@ class StructuredStickerModel(LegacyModel):
         attention_mask: torch.Tensor,
         img_ids: Sequence[int],
         img_emb: torch.Tensor,
+        dialogue_q: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         text_emb = self._get_text_word_embeddings(input_ids)
         input_emb, full_attention_mask, token_type_ids = self._build_multimodal_inputs(
@@ -657,6 +696,7 @@ class StructuredStickerModel(LegacyModel):
             attention_mask=attention_mask,
             img_emb=img_emb,
             img_ids=img_ids,
+            dialogue_q=dialogue_q,
         )
         outputs = self.bert(
             inputs_embeds=input_emb,
@@ -720,9 +760,9 @@ class StructuredStickerModel(LegacyModel):
             assert (
                 valid_c.size(0) == neighbor_c.size(0)
             ), "style neighbor c_i / c_j batch size mismatch"
-        sample_loss[torch.tensor(valid_indices, device=c_i.device, dtype=torch.long)] = (
-            1.0 - self._cosine_similarity_from_raw(valid_c, neighbor_c)
-        )
+        idx_t = torch.tensor(valid_indices, device=c_i.device, dtype=torch.long)
+        per_neighbor = 1.0 - self._cosine_similarity_from_raw(valid_c, neighbor_c)
+        sample_loss[idx_t] = per_neighbor.to(dtype=sample_loss.dtype)
         debug_meta["valid_style_neighbor_pairs"] = len(valid_neighbor_ids)
         debug_meta["sampled_neighbor_pairs_preview"] = sampled_pairs[:8]
         return sample_loss.mean(), debug_meta
@@ -857,12 +897,14 @@ class StructuredStickerModel(LegacyModel):
             attention_mask=attention_mask,
             img_ids=img_ids,
             img_emb=pos_h,
+            dialogue_q=q,
         )
         neg_logits = self._compute_pair_logits(
             input_ids=input_ids,
             attention_mask=attention_mask,
             img_ids=neg_img_ids,
             img_emb=neg_h,
+            dialogue_q=q,
         )
 
         pos_u, pos_c, pos_a = self.decompose_sticker(pos_h)
@@ -1777,12 +1819,20 @@ def build_trainer(args: StructuredArguments, for_train: bool) -> pl.Trainer:
     callbacks: List[Callback] = []
     if for_train:
         callbacks.append(ModelCheckpoint(save_top_k=-1, verbose=True))
-        if args.gpus and args.gpus > 1:
+        if (
+            args.gpus
+            and args.gpus > 1
+            and getattr(args, "ddp_static_graph_callback", False)
+            and getattr(args, "bert_gradient_checkpointing", True)
+        ):
             callbacks.append(DdpStaticGraphCallback())
     if callbacks:
         trainer_kwargs["callbacks"] = callbacks
     if args.gpus and args.gpus > 1:
         trainer_kwargs["accelerator"] = "ddp"
+        fu = getattr(args, "ddp_find_unused_parameters", None)
+        if fu is not None:
+            trainer_kwargs["plugins"] = DDPPlugin(find_unused_parameters=fu)
     return pl.Trainer(**trainer_kwargs)
 
 
@@ -1959,6 +2009,7 @@ def run_structured_main(args: StructuredArguments) -> None:
         trainer = build_trainer(args, for_train=True)
         attach_version_log_from_trainer(args, trainer)
         trainer.fit(model, datamodule=datamodule)
+        save_final_checkpoint_from_trainer(trainer, args)
         return
 
     if args.mode in {"test", "gen"}:

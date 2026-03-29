@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # (must be set before importing pytorch_lightning/tensorboard).
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
+import distutils_tensorboard_shim  # noqa: F401
+
 import pytorch_lightning as pl
 import torch
 from torch import nn
@@ -205,6 +207,7 @@ class StructuredResidualStickerModel(StructuredStickerModel):
         attention_mask: torch.Tensor,
         img_emb: torch.Tensor,
         img_ids: Sequence[int],
+        dialogue_q: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = text_emb.device
         batch_size = img_emb.size(0)
@@ -215,7 +218,12 @@ class StructuredResidualStickerModel(StructuredStickerModel):
 
         q = None
         if self.args.residual_condition_mode == "query_gate" and self.args.struct_residual_mode != "none":
-            q = self.encode_dialogue_query_from_text_emb(text_emb, attention_mask)
+            # Reuse precomputed dialogue_q from encode_dialogue_query when provided (train / eval).
+            # Extra bert.bert here + DDP + gradient checkpoint causes "marked as ready twice".
+            if dialogue_q is not None:
+                q = dialogue_q
+            else:
+                q = self.encode_dialogue_query_from_text_emb(text_emb, attention_mask)
         sticker_token, residual_stats = self._build_sticker_residual(img_emb, base_sticker_token, q)
 
         sep_emb = self._build_sep_embeddings(batch_size=batch_size, device=device)
@@ -315,6 +323,7 @@ class StructuredResidualStickerModel(StructuredStickerModel):
             attention_mask=expanded_attention_mask,
             img_ids=candidate_ids,
             img_emb=candidate_h,
+            dialogue_q=q.repeat(img_num, 1),
         )
         mod_backbone_score = self.compute_base_score(mod_logits)
 

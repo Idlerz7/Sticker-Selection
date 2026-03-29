@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # (must be set before importing pytorch_lightning/tensorboard).
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
+import distutils_tensorboard_shim  # noqa: F401
+
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
@@ -21,6 +23,7 @@ from main import (
     attach_test_log_to_ckpt_version,
     attach_version_log_from_trainer,
     logger,
+    save_final_checkpoint_from_trainer,
 )
 from metrics import MyAccuracy
 from structured_retrieval import (
@@ -35,7 +38,6 @@ from structured_retrieval import (
     load_checkpoint_to_model,
     maybe_set_ddp_static_graph,
     nonempty_batch_cands,
-    normalize_sticker_id,
 )
 from structured_retrieval_tokens import (
     _config_mapping_to_argv,
@@ -72,12 +74,11 @@ class StructuredFactorizedArguments(StructuredArguments):
 
     factorized_fusion_hidden_dim: Optional[int] = field(default=32)
     factorized_proto_logit_scale: Optional[float] = field(default=10.0)
+    factorized_proto_consistency_weight: Optional[float] = field(default=0.0)
     factorized_log_interval: Optional[int] = field(default=200)
     factorized_train_bank_refresh_steps: Optional[int] = field(default=0)
     # true = one MM-BERT forward at batch 3B; false = three forwards at batch B (default, matches older runs).
     factorized_fused_train_mmbert: Optional[bool] = field(default=False)
-    # Turn off only for debugging speed; training memory is much higher without checkpointing.
-    bert_gradient_checkpointing: Optional[bool] = field(default=True)
     # First N global steps: log mean CUDA section times for forward_train_batch (ms/step).
     # Env STICKER_FACTORIZED_PROFILE_STEPS overrides if larger.
     factorized_profile_train_steps: Optional[int] = field(default=0)
@@ -87,8 +88,16 @@ class StructuredFactorizedArguments(StructuredArguments):
     factorized_train_two_way_neg: Optional[str] = field(default="same")
 
     lambda_style_proto: Optional[float] = field(default=0.4)
+    lambda_orth: Optional[float] = field(default=0.5)
     train_same_proto_negatives: Optional[int] = field(default=1)
     train_cross_proto_negatives: Optional[int] = field(default=1)
+    factorized_stage1_ratio: Optional[float] = field(default=0.0)
+    factorized_stage1_struct_scale: Optional[float] = field(default=1.0)
+    factorized_stage1_expr_scale: Optional[float] = field(default=1.0)
+    factorized_stage1_style_proto_scale: Optional[float] = field(default=1.0)
+    factorized_stage2_struct_scale: Optional[float] = field(default=1.0)
+    factorized_stage2_expr_scale: Optional[float] = field(default=1.0)
+    factorized_stage2_style_proto_scale: Optional[float] = field(default=1.0)
 
     def __post_init__(self):
         super().__post_init__()
@@ -98,7 +107,6 @@ class StructuredFactorizedArguments(StructuredArguments):
             "factorized_proto_expand_per_proto": self.factorized_proto_expand_per_proto,
             "factorized_mmbert_branch_topk": self.factorized_mmbert_branch_topk,
             "factorized_candidate_union_topk": self.factorized_candidate_union_topk,
-            "factorized_fusion_hidden_dim": self.factorized_fusion_hidden_dim,
             "factorized_min_fine_proto_size": self.factorized_min_fine_proto_size,
             "factorized_min_coarse_proto_size": self.factorized_min_coarse_proto_size,
             "train_same_proto_negatives": self.train_same_proto_negatives,
@@ -109,8 +117,13 @@ class StructuredFactorizedArguments(StructuredArguments):
                 raise ValueError(f"{field_name} must be > 0.")
         if float(self.lambda_style_proto) < 0:
             raise ValueError("lambda_style_proto must be >= 0.")
+        if float(self.lambda_orth or 0.0) < 0:
+            raise ValueError("lambda_orth must be >= 0.")
         if float(self.factorized_proto_logit_scale) <= 0:
             raise ValueError("factorized_proto_logit_scale must be > 0.")
+        proto_consistency_weight = float(self.factorized_proto_consistency_weight or 0.0)
+        if proto_consistency_weight < 0.0 or proto_consistency_weight > 1.0:
+            raise ValueError("factorized_proto_consistency_weight must be within [0, 1].")
         if self.factorized_log_interval is not None and int(self.factorized_log_interval) < 0:
             raise ValueError("factorized_log_interval must be >= 0 (0 = off).")
         if (
@@ -118,8 +131,6 @@ class StructuredFactorizedArguments(StructuredArguments):
             and int(self.factorized_train_bank_refresh_steps) < 0
         ):
             raise ValueError("factorized_train_bank_refresh_steps must be >= 0 (0 = exact per-step).")
-        if self.bert_gradient_checkpointing is None:
-            self.bert_gradient_checkpointing = True
         if self.factorized_fused_train_mmbert is None:
             self.factorized_fused_train_mmbert = False
         if self.factorized_profile_train_steps is not None and int(self.factorized_profile_train_steps) < 0:
@@ -134,6 +145,20 @@ class StructuredFactorizedArguments(StructuredArguments):
             raise ValueError(
                 "factorized_bank_source must be one of {'pseudo_labels', 'style_metadata'}."
             )
+        stage_ratio = float(self.factorized_stage1_ratio or 0.0)
+        if stage_ratio < 0.0 or stage_ratio > 1.0:
+            raise ValueError("factorized_stage1_ratio must be within [0, 1].")
+        scale_fields = {
+            "factorized_stage1_struct_scale": self.factorized_stage1_struct_scale,
+            "factorized_stage1_expr_scale": self.factorized_stage1_expr_scale,
+            "factorized_stage1_style_proto_scale": self.factorized_stage1_style_proto_scale,
+            "factorized_stage2_struct_scale": self.factorized_stage2_struct_scale,
+            "factorized_stage2_expr_scale": self.factorized_stage2_expr_scale,
+            "factorized_stage2_style_proto_scale": self.factorized_stage2_style_proto_scale,
+        }
+        for field_name, value in scale_fields.items():
+            if float(value) < 0.0:
+                raise ValueError(f"{field_name} must be >= 0.")
 
 
 @dataclass
@@ -141,60 +166,103 @@ class StructuredFactorizedForwardOutput:
     loss: torch.Tensor
     match_loss: torch.Tensor
     style_proto_loss: torch.Tensor
-    style_neighbor_loss: torch.Tensor
     orth_loss: torch.Tensor
     expr_rank_loss: torch.Tensor
-    aux_warmup: torch.Tensor
     pos_fused_score: torch.Tensor
     cross_fused_score: torch.Tensor
     same_fused_score: torch.Tensor
-    style_usage_gate: torch.Tensor
     debug_info: Optional[Dict[str, Any]] = None
+
+
+class DialogueFactorizer(nn.Module):
+    """Query-side factorization for style and expression preferences."""
+
+    def __init__(self, hidden_dim: int, structured_dim: int, dropout: float):
+        super().__init__()
+        self.style_query_head = ProjectionHead(hidden_dim, structured_dim, dropout)
+        self.expr_query_head = ProjectionHead(hidden_dim, structured_dim, dropout)
+
+    def forward(self, cls_hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_style = self.style_query_head(cls_hidden)
+        q_expr = self.expr_query_head(cls_hidden)
+        return q_style, q_expr
+
+
+class StickerFactorizer(nn.Module):
+    """Sticker-side factorization into shared/style/expression components."""
+
+    def __init__(self, visual_dim: int, structured_dim: int, dropout: float):
+        super().__init__()
+        self.shared_sticker_head = nn.Sequential(
+            nn.Linear(visual_dim, structured_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(structured_dim, structured_dim),
+        )
+        self.style_head = ProjectionHead(structured_dim, structured_dim, dropout)
+        self.expr_head = ProjectionHead(structured_dim, structured_dim, dropout)
+
+    def forward(self, sticker_hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        shared = self.shared_sticker_head(sticker_hidden)
+        style = self.style_head(shared)
+        expr = self.expr_head(shared)
+        return shared, style, expr
+
+
+class PrototypeReasoner(nn.Module):
+    """Prototype-level style prior reasoning on top of instance factorization."""
+
+    def __init__(self, structured_dim: int, dropout: float):
+        super().__init__()
+        self.prototype_match_head = ScalarMatchHead(structured_dim, dropout)
+
+    def compute_proto_logits(
+        self,
+        q_style: torch.Tensor,
+        proto_vectors: torch.Tensor,
+        logit_scale: float,
+    ) -> torch.Tensor:
+        if proto_vectors.ndim == 1:
+            proto_vectors = proto_vectors.unsqueeze(0)
+        norm_q = F.normalize(q_style, dim=-1)
+        norm_p = F.normalize(proto_vectors, dim=-1)
+        return float(logit_scale) * torch.matmul(norm_q, norm_p.transpose(0, 1))
+
+    def gather_proto_scores(
+        self,
+        proto_logits: torch.Tensor,
+        proto_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if proto_logits.ndim == 2:
+            batch_idx = torch.arange(proto_logits.size(0), device=proto_logits.device)
+            return proto_logits[batch_idx, proto_ids]
+        return proto_logits.index_select(0, proto_ids)
 
 
 class StructuredFactorizedStickerModel(StructuredStickerModel):
     def __init__(self, args: StructuredFactorizedArguments):
         super().__init__(args)
         self.args = args
-        self.style_query_head = ProjectionHead(
+        self.dialogue_factorizer = DialogueFactorizer(
             self.bert_hidden_dim, args.structured_hidden_dim, args.structured_dropout
         )
-        self.expr_query_head = ProjectionHead(
-            self.bert_hidden_dim, args.structured_hidden_dim, args.structured_dropout
+        self.sticker_factorizer = StickerFactorizer(
+            self.visual_feat_dim, args.structured_hidden_dim, args.structured_dropout
         )
-        self.style_usage_gate_head = nn.Sequential(
-            nn.Linear(args.structured_hidden_dim * 2, args.structured_hidden_dim),
-            nn.Tanh(),
-            nn.Dropout(args.structured_dropout),
-            nn.Linear(args.structured_hidden_dim, 1),
-        )
-        self.prototype_match_head = ScalarMatchHead(
+        self.prototype_reasoner = PrototypeReasoner(
             args.structured_hidden_dim, args.structured_dropout
         )
-        # Factorized training runs BERT many times per step (query encoder + 3×pair); checkpointing
-        # cuts activation VRAM. One fused 3×B forward is worse for attention memory than three B-sized passes.
-        if getattr(args, "bert_gradient_checkpointing", True):
-            if hasattr(self.bert, "gradient_checkpointing_enable"):
-                self.bert.gradient_checkpointing_enable()
-                logger.info(
-                    "[StructuredFactorized] BERT gradient checkpointing enabled (lower VRAM, slower step)."
-                )
-            else:
-                self.bert.config.gradient_checkpointing = True
-                logger.info(
-                    "[StructuredFactorized] Set config.gradient_checkpointing=True on BERT."
-                )
-        else:
+        self.style_query_head = self.dialogue_factorizer.style_query_head
+        self.expr_query_head = self.dialogue_factorizer.expr_query_head
+        self.shared_sticker_head = self.sticker_factorizer.shared_sticker_head
+        self.style_head = self.sticker_factorizer.style_head
+        self.expr_head = self.sticker_factorizer.expr_head
+        self.prototype_match_head = self.prototype_reasoner.prototype_match_head
+        if not getattr(args, "bert_gradient_checkpointing", True):
             logger.info(
-                "[StructuredFactorized] BERT gradient checkpointing disabled "
-                "(faster steps, much higher VRAM; avoid fused 3× MM-BERT if OOM)."
+                "[StructuredFactorized] bert_gradient_checkpointing=False "
+                "(faster steps, much higher VRAM)."
             )
-        self.fusion_head = nn.Sequential(
-            nn.Linear(5, args.factorized_fusion_hidden_dim),
-            nn.Tanh(),
-            nn.Dropout(args.structured_dropout),
-            nn.Linear(args.factorized_fusion_hidden_dim, 1),
-        )
         self._factorized_bank_rng = torch.Generator().manual_seed(int(args.seed))
         self._python_bank_rng = random.Random(int(args.seed))
         self.style_bank = self._load_or_build_style_bank()
@@ -332,13 +400,18 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         proto_ids: List[int] = []
         proto_counts: List[float] = []
         proto_density: List[float] = []
+        consistency_weight = float(getattr(self.args, "factorized_proto_consistency_weight", 0.0) or 0.0)
         for proto in self.style_bank.prototypes:
             pid = int(proto.proto_id)
             members = [int(x) for x in proto.member_ids]
             member_ids.extend(members)
             proto_ids.extend([pid] * len(members))
             proto_counts.append(float(len(members)))
-            proto_density.append(float(proto.proto_density))
+            base_density = float(proto.proto_density)
+            style_consistency = float(getattr(proto, "style_consistency", 0.0) or 0.0)
+            proto_density.append(
+                base_density * ((1.0 - consistency_weight) + consistency_weight * style_consistency)
+            )
         tensors = (
             torch.tensor(member_ids, dtype=torch.long, device=device),
             torch.tensor(proto_ids, dtype=torch.long, device=device),
@@ -426,20 +499,19 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
 
     def encode_style_expr_queries(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         text_emb = self._get_text_word_embeddings(input_ids)
         outputs = self.bert.bert(
             inputs_embeds=text_emb,
             attention_mask=attention_mask,
             return_dict=True,
         )
-        cls = outputs.last_hidden_state[:, 0, :]
-        q_style = self.style_query_head(cls)
-        q_expr = self.expr_query_head(cls)
-        style_usage_gate = torch.sigmoid(
-            self.style_usage_gate_head(torch.cat([q_style, q_expr], dim=-1))
-        ).squeeze(-1)
-        return q_style, q_expr, style_usage_gate
+        return self.dialogue_factorizer(outputs.last_hidden_state[:, 0, :])
+
+    def decompose_sticker(
+        self, h: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.sticker_factorizer(h)
 
     def _compute_proto_vectors(
         self, style_bank_c: torch.Tensor
@@ -468,56 +540,49 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
     def _compute_proto_logits(
         self, q_style: torch.Tensor, proto_vectors: torch.Tensor
     ) -> torch.Tensor:
-        if proto_vectors.ndim == 1:
-            proto_vectors = proto_vectors.unsqueeze(0)
-        norm_q = F.normalize(q_style, dim=-1)
-        norm_p = F.normalize(proto_vectors, dim=-1)
-        scale = float(self.args.factorized_proto_logit_scale)
-        return scale * torch.matmul(norm_q, norm_p.transpose(0, 1))
+        return self.prototype_reasoner.compute_proto_logits(
+            q_style=q_style,
+            proto_vectors=proto_vectors,
+            logit_scale=float(self.args.factorized_proto_logit_scale),
+        )
 
     def _gather_proto_scores_for_batch(
         self,
         proto_logits: torch.Tensor,
-        proto_density: torch.Tensor,
         sticker_ids: Sequence[int],
     ) -> torch.Tensor:
         sticker_to_proto = self._get_sticker_to_proto(proto_logits.device)
         sticker_idx = torch.tensor(list(sticker_ids), dtype=torch.long, device=proto_logits.device)
         proto_ids = sticker_to_proto.index_select(0, sticker_idx)
-        batch_idx = torch.arange(proto_logits.size(0), device=proto_logits.device)
-        gathered = proto_logits[batch_idx, proto_ids]
-        return gathered * proto_density.index_select(0, proto_ids)
+        return self.prototype_reasoner.gather_proto_scores(
+            proto_logits=proto_logits,
+            proto_ids=proto_ids,
+        )
 
     def _gather_proto_scores_for_candidates(
         self,
         proto_logit_row: torch.Tensor,
-        proto_density: torch.Tensor,
         candidate_ids: Sequence[int],
     ) -> torch.Tensor:
         sticker_to_proto = self._get_sticker_to_proto(proto_logit_row.device)
         sticker_idx = torch.tensor(list(candidate_ids), dtype=torch.long, device=proto_logit_row.device)
         proto_ids = sticker_to_proto.index_select(0, sticker_idx)
-        return proto_logit_row.index_select(0, proto_ids) * proto_density.index_select(0, proto_ids)
+        return self.prototype_reasoner.gather_proto_scores(
+            proto_logits=proto_logit_row,
+            proto_ids=proto_ids,
+        )
 
-    def _fuse_scores(
+    def _compute_final_score(
         self,
         mmbert_score: torch.Tensor,
-        style_score: torch.Tensor,
         expr_score: torch.Tensor,
         graph_score: torch.Tensor,
-        style_usage_gate: torch.Tensor,
     ) -> torch.Tensor:
-        gate = style_usage_gate
-        while gate.ndim < mmbert_score.ndim:
-            gate = gate.unsqueeze(-1)
-        gate = gate.expand_as(mmbert_score)
-        stacked = torch.stack(
-            [mmbert_score, style_score, expr_score, graph_score, gate], dim=-1
-        )
-        fused = self.fusion_head(stacked).squeeze(-1)
-        if self.args.base_only:
+        if bool(self.args.base_only):
             return mmbert_score
-        return fused
+        le = float(self.args.lambda_expr or 0.0)
+        lp = float(self.args.lambda_style_proto or 0.0)
+        return mmbert_score + le * expr_score + lp * graph_score
 
     def _resolve_cross_proto_negatives(
         self, pos_ids: Sequence[int], fallback_neg_ids: Sequence[int]
@@ -546,53 +611,82 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
             resolved.append(int(sampled) if sampled is not None else int(neg_id))
         return resolved
 
-    def _compute_style_neighbor_loss_with_meta(
-        self, pos_img_ids: Sequence[int], c_i: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        debug_meta: Dict[str, Any] = {
-            "valid_style_neighbor_pairs": 0,
-            "total_positive_samples": len(pos_img_ids),
-            "missing_neighbor_img_ids": [],
-            "sampled_neighbor_pairs_preview": [],
+    def _resolve_prototype_aware_negatives(
+        self,
+        q_expr: torch.Tensor,
+        pos_ids: Sequence[int],
+        fallback_neg_ids: Sequence[int],
+        style_bank_a: torch.Tensor,
+    ) -> Tuple[List[int], List[int], Dict[str, Any]]:
+        cross_pool_size = max(1, int(getattr(self.args, "train_cross_proto_negatives", 1) or 1))
+        same_pool_size = max(1, int(getattr(self.args, "train_same_proto_negatives", 1) or 1))
+        cross_neg_ids: List[int] = []
+        same_neg_ids: List[int] = []
+        debug = {
+            "cross_pool_size": cross_pool_size,
+            "same_pool_size": same_pool_size,
+            "cross_pool_preview": [],
+            "same_pool_preview": [],
         }
-        if self.args.lambda_struct <= 0 or self.args.style_neighbor_topk <= 0:
-            return c_i.new_zeros(()), debug_meta
 
-        valid_indices: List[int] = []
-        valid_neighbor_ids: List[int] = []
-        sampled_pairs: List[Tuple[int, int]] = []
+        def _select_hard_negative(
+            q_expr_row: torch.Tensor,
+            pool_ids: Sequence[int],
+        ) -> int:
+            if len(pool_ids) == 1:
+                return int(pool_ids[0])
+            pool_idx = torch.tensor(list(pool_ids), dtype=torch.long, device=q_expr_row.device)
+            cand_a = style_bank_a.index_select(0, pool_idx)
+            rep_q_expr = q_expr_row.unsqueeze(0).repeat(len(pool_ids), 1)
+            expr_score = self.compute_expression_compatibility(rep_q_expr, cand_a)
+            hard_idx = int(torch.argmax(expr_score).item())
+            return int(pool_ids[hard_idx])
 
-        for idx, img_id in enumerate(pos_img_ids):
-            sampled = self.neighbor_store.sample(
-                sticker_id=img_id,
-                topk=self.args.style_neighbor_topk,
-                sampling_mode=self.args.style_sampling_mode,
-                rng=self._neighbor_rng,
-            )
-            if sampled is None:
-                debug_meta["missing_neighbor_img_ids"].append(int(img_id))
-                continue
-            normalized = normalize_sticker_id(sampled)
-            if isinstance(normalized, int):
-                valid_indices.append(idx)
-                valid_neighbor_ids.append(normalized)
-                sampled_pairs.append((int(img_id), normalized))
-            else:
-                debug_meta["missing_neighbor_img_ids"].append(int(img_id))
+        for batch_idx, (pos_id, fallback_neg_id) in enumerate(zip(pos_ids, fallback_neg_ids)):
+            cross_first = self._resolve_cross_proto_negatives([pos_id], [fallback_neg_id])[0]
+            cross_pool = [int(cross_first)]
+            while len(cross_pool) < cross_pool_size:
+                sampled = self.style_bank.sample_cross_proto_negative(
+                    int(pos_id), self._python_bank_rng, exclude_ids=cross_pool + [int(fallback_neg_id)]
+                )
+                if sampled is None or int(sampled) in cross_pool:
+                    break
+                cross_pool.append(int(sampled))
+            cross_choice = _select_hard_negative(q_expr[batch_idx], cross_pool)
+            cross_neg_ids.append(cross_choice)
 
-        sample_loss = c_i.new_zeros(c_i.size(0))
-        if not valid_neighbor_ids:
-            return sample_loss.mean(), debug_meta
+            same_first = self._resolve_same_proto_negatives([pos_id], [cross_choice])[0]
+            same_pool = [int(same_first)]
+            while len(same_pool) < same_pool_size:
+                sampled = self.style_bank.sample_same_proto_negative(
+                    int(pos_id), self._python_bank_rng, exclude_ids=same_pool + [cross_choice]
+                )
+                if sampled is None or int(sampled) in same_pool:
+                    break
+                same_pool.append(int(sampled))
+            same_choice = _select_hard_negative(q_expr[batch_idx], same_pool)
+            same_neg_ids.append(same_choice)
 
-        neighbor_h = self.get_emb_by_imgids(valid_neighbor_ids).to(c_i.device)
-        _, neighbor_c, _ = self.decompose_sticker(neighbor_h)
-        valid_c = c_i[torch.tensor(valid_indices, device=c_i.device, dtype=torch.long)]
-        sample_loss[torch.tensor(valid_indices, device=c_i.device, dtype=torch.long)] = (
-            1.0 - self._cosine_similarity_from_raw(valid_c, neighbor_c)
-        )
-        debug_meta["valid_style_neighbor_pairs"] = len(valid_neighbor_ids)
-        debug_meta["sampled_neighbor_pairs_preview"] = sampled_pairs[:8]
-        return sample_loss.mean(), debug_meta
+            if batch_idx < 4:
+                debug["cross_pool_preview"].append([int(x) for x in cross_pool])
+                debug["same_pool_preview"].append([int(x) for x in same_pool])
+
+        return cross_neg_ids, same_neg_ids, debug
+
+    def _compute_proto_supervision(
+        self,
+        q_style: torch.Tensor,
+        proto_vectors: torch.Tensor,
+        pos_ids: Sequence[int],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        proto_logits = self._compute_proto_logits(q_style, proto_vectors)
+        sticker_to_proto = self._get_sticker_to_proto(device)
+        pos_idx = torch.tensor(list(pos_ids), dtype=torch.long, device=device)
+        pos_proto_ids = sticker_to_proto.index_select(0, pos_idx)
+        style_proto_loss = F.cross_entropy(proto_logits, pos_proto_ids)
+        proto_acc = (torch.argmax(proto_logits, dim=-1) == pos_proto_ids).float().mean()
+        return proto_logits, pos_proto_ids, style_proto_loss, proto_acc
 
     def _compute_mmbert_score_batch(
         self,
@@ -675,17 +769,6 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         base = self.compute_base_score(logits)
         return base[:b], base[b:]
 
-    def _compute_candidate_factor_scores(
-        self,
-        q_style: torch.Tensor,
-        q_expr: torch.Tensor,
-        candidate_c: torch.Tensor,
-        candidate_a: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        style_score = self.compute_style_compatibility(q_style, candidate_c)
-        expr_score = self.compute_expression_compatibility(q_expr, candidate_a)
-        return style_score, expr_score
-
     def forward_train_batch(
         self,
         input_ids: torch.Tensor,
@@ -703,25 +786,27 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
             torch.cuda.synchronize()
             pe[0].record()
 
-        q_style, q_expr, style_usage_gate = self.encode_style_expr_queries(
-            input_ids, attention_mask
-        )
+        q_style, q_expr = self.encode_style_expr_queries(input_ids, attention_mask)
 
         if do_prof:
             pe[1].record()
 
-        bank_all_h, _, _, proto_vectors, proto_density = self._get_train_or_fresh_bank_factorization(
-            device, global_step
+        bank_all_h, style_bank_c, style_bank_a, proto_vectors, _ = (
+            self._get_train_or_fresh_bank_factorization(device, global_step)
         )
-        proto_logits = self._compute_proto_logits(q_style, proto_vectors)
-        sticker_to_proto = self._get_sticker_to_proto(device)
-        pos_idx = torch.tensor(list(img_ids), dtype=torch.long, device=device)
-        pos_proto_ids = sticker_to_proto.index_select(0, pos_idx)
-        style_proto_loss = F.cross_entropy(proto_logits, pos_proto_ids)
-        proto_acc = (torch.argmax(proto_logits, dim=-1) == pos_proto_ids).float().mean()
+        proto_logits, pos_proto_ids, style_proto_loss, proto_acc = self._compute_proto_supervision(
+            q_style=q_style,
+            proto_vectors=proto_vectors,
+            pos_ids=img_ids,
+            device=device,
+        )
 
-        cross_neg_ids = self._resolve_cross_proto_negatives(img_ids, neg_img_ids)
-        same_neg_ids = self._resolve_same_proto_negatives(img_ids, cross_neg_ids)
+        cross_neg_ids, same_neg_ids, proto_train_meta = self._resolve_prototype_aware_negatives(
+            q_expr=q_expr,
+            pos_ids=img_ids,
+            fallback_neg_ids=neg_img_ids,
+            style_bank_a=style_bank_a,
+        )
 
         two_way = bool(getattr(self.args, "factorized_train_mmbert_two_way", False))
         tw_neg = str(getattr(self.args, "factorized_train_two_way_neg", "same") or "same").lower()
@@ -823,52 +908,31 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
 
         _, pos_c, pos_a = self.decompose_sticker(pos_h)
         if cross_h is not None:
-            _, cross_c, cross_a = self.decompose_sticker(cross_h)
+            _, _, cross_a = self.decompose_sticker(cross_h)
         else:
-            cross_c = pos_c.new_zeros(pos_c.shape)
             cross_a = pos_a.new_zeros(pos_a.shape)
-        _, same_c, same_a = self.decompose_sticker(same_h)
+        _, _, same_a = self.decompose_sticker(same_h)
 
-        pos_style, pos_expr = self._compute_candidate_factor_scores(
-            q_style, q_expr, pos_c, pos_a
-        )
-        cross_style, cross_expr = self._compute_candidate_factor_scores(
-            q_style, q_expr, cross_c, cross_a
-        )
-        same_style, same_expr = self._compute_candidate_factor_scores(
-            q_style, q_expr, same_c, same_a
-        )
+        pos_expr = self.compute_expression_compatibility(q_expr, pos_a)
+        cross_expr = self.compute_expression_compatibility(q_expr, cross_a)
+        same_expr = self.compute_expression_compatibility(q_expr, same_a)
 
-        pos_graph = self._gather_proto_scores_for_batch(proto_logits, proto_density, img_ids)
+        pos_graph = self._gather_proto_scores_for_batch(proto_logits, img_ids)
         if cross_h is not None:
-            cross_graph = self._gather_proto_scores_for_batch(
-                proto_logits, proto_density, cross_neg_ids
-            )
+            cross_graph = self._gather_proto_scores_for_batch(proto_logits, cross_neg_ids)
         else:
             cross_graph = pos_graph.new_zeros(pos_graph.shape)
-        same_graph = self._gather_proto_scores_for_batch(
-            proto_logits, proto_density, same_neg_ids
-        )
+        same_graph = self._gather_proto_scores_for_batch(proto_logits, same_neg_ids)
 
-        pos_fused = self._fuse_scores(
-            pos_mmbert, pos_style, pos_expr, pos_graph, style_usage_gate
-        )
+        pos_fused = self._compute_final_score(pos_mmbert, pos_expr, pos_graph)
         if not two_way:
-            cross_fused = self._fuse_scores(
-                cross_mmbert, cross_style, cross_expr, cross_graph, style_usage_gate
-            )
-            same_fused = self._fuse_scores(
-                same_mmbert, same_style, same_expr, same_graph, style_usage_gate
-            )
+            cross_fused = self._compute_final_score(cross_mmbert, cross_expr, cross_graph)
+            same_fused = self._compute_final_score(same_mmbert, same_expr, same_graph)
         elif tw_neg == "same":
             cross_fused = pos_mmbert.new_zeros(pos_mmbert.shape)
-            same_fused = self._fuse_scores(
-                same_mmbert, same_style, same_expr, same_graph, style_usage_gate
-            )
+            same_fused = self._compute_final_score(same_mmbert, same_expr, same_graph)
         else:
-            cross_fused = self._fuse_scores(
-                cross_mmbert, cross_style, cross_expr, cross_graph, style_usage_gate
-            )
+            cross_fused = self._compute_final_score(cross_mmbert, cross_expr, cross_graph)
             same_fused = pos_mmbert.new_zeros(pos_mmbert.shape)
 
         if not two_way:
@@ -880,43 +944,38 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         train_labels = torch.zeros(train_logits.size(0), dtype=torch.long, device=device)
         match_loss = F.cross_entropy(train_logits, train_labels)
 
-        style_neighbor_loss, style_neighbor_meta = self._compute_style_neighbor_loss_with_meta(
-            img_ids, pos_c
-        )
         orth_loss = self.compute_orth_loss(pos_c, pos_a)
         expr_rank_loss = self.compute_expr_rank_loss(pos_expr, same_expr)
-        aux_warmup = self.compute_aux_warmup(
-            global_step=global_step, total_steps=total_steps
-        ).to(device=device)
-
-        structured_aux = self.args.lambda_struct * (style_neighbor_loss + orth_loss)
-        expr_aux = self.args.lambda_expr * expr_rank_loss
-        style_proto_aux = float(self.args.lambda_style_proto) * style_proto_loss
+        lp = float(self.args.lambda_style_proto or 0.0) * style_proto_loss
+        le = float(self.args.lambda_expr or 0.0) * expr_rank_loss
+        lo = float(self.args.lambda_orth or 0.0) * orth_loss
         if self.args.base_only:
-            structured_aux = structured_aux * 0.0
-            expr_aux = expr_aux * 0.0
-            style_proto_aux = style_proto_aux * 0.0
-        total_loss = match_loss + aux_warmup * (structured_aux + expr_aux + style_proto_aux)
+            lp = lp * 0.0
+            le = le * 0.0
+            lo = lo * 0.0
+        total_loss = match_loss + lp + le + lo
 
-        # One small tensor for training_step: a single .cpu() sync per step instead of many .item() calls.
-        train_scalars = torch.stack(
-            [
-                proto_acc.reshape(()),
-                style_usage_gate.mean().reshape(()),
-                (pos_fused - same_fused).mean().reshape(()),
-                pos_mmbert.mean().reshape(()),
-                cross_mmbert.mean().reshape(()),
-                same_mmbert.mean().reshape(()),
-                pos_style.mean().reshape(()),
-                same_expr.mean().reshape(()),
-            ],
-            dim=0,
-        )
+        # Debug scalars only (not in total_loss). Build under no_grad so we do not attach extra
+        # autograd edges from shared tensors (pos_fused, same_fused, ...); extra branches have
+        # caused rare EngineBase.run_backward NULL failures with DDP + gradient checkpointing.
+        with torch.no_grad():
+            train_scalars = torch.stack(
+                [
+                    proto_acc.reshape(()),
+                    (pos_fused - same_fused).mean().reshape(()),
+                    pos_mmbert.mean().reshape(()),
+                    cross_mmbert.mean().reshape(()),
+                    same_mmbert.mean().reshape(()),
+                    pos_expr.mean().reshape(()),
+                    same_expr.mean().reshape(()),
+                ],
+                dim=0,
+            )
         debug_info = {
             "_train_scalars": train_scalars,
             "cross_neg_ids_preview": [int(x) for x in cross_neg_ids[:8]],
             "same_neg_ids_preview": [int(x) for x in same_neg_ids[:8]],
-            "style_neighbor_meta": style_neighbor_meta,
+            "prototype_train_meta": proto_train_meta,
         }
 
         if do_prof:
@@ -935,63 +994,13 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
             loss=total_loss,
             match_loss=match_loss,
             style_proto_loss=style_proto_loss,
-            style_neighbor_loss=style_neighbor_loss,
             orth_loss=orth_loss,
             expr_rank_loss=expr_rank_loss,
-            aux_warmup=aux_warmup,
             pos_fused_score=pos_fused,
             cross_fused_score=cross_fused,
             same_fused_score=same_fused,
-            style_usage_gate=style_usage_gate,
             debug_info=debug_info,
         )
-
-    def _build_candidate_union(
-        self,
-        candidate_ids: Sequence[int],
-        style_score: torch.Tensor,
-        mmbert_score: torch.Tensor,
-        proto_logits_row: torch.Tensor,
-    ) -> Tuple[List[int], Dict[str, Any]]:
-        style_topk = min(len(candidate_ids), int(self.args.factorized_style_recall_topk))
-        mmbert_topk = min(len(candidate_ids), int(self.args.factorized_mmbert_branch_topk))
-        proto_topk = min(len(self.style_bank.prototypes), int(self.args.factorized_style_proto_topk))
-
-        style_rank_idx = torch.topk(style_score, k=style_topk).indices.tolist()
-        style_branch_ids = [int(candidate_ids[idx]) for idx in style_rank_idx]
-
-        top_proto_ids = torch.topk(proto_logits_row, k=proto_topk).indices.tolist()
-        proto_branch_ids = self.style_bank.expand_top_prototypes(
-            top_proto_ids,
-            allowed_ids=candidate_ids,
-            per_proto_limit=int(self.args.factorized_proto_expand_per_proto),
-        )
-
-        mmbert_branch_ids: List[int] = []
-        if self.args.factorized_use_mmbert_branch:
-            mmbert_rank_idx = torch.topk(mmbert_score, k=mmbert_topk).indices.tolist()
-            mmbert_branch_ids = [int(candidate_ids[idx]) for idx in mmbert_rank_idx]
-
-        ordered_union: List[int] = []
-        seen = set()
-        for group in (style_branch_ids, proto_branch_ids, mmbert_branch_ids):
-            for sticker_id in group:
-                if sticker_id in seen:
-                    continue
-                ordered_union.append(int(sticker_id))
-                seen.add(int(sticker_id))
-                if len(ordered_union) >= int(self.args.factorized_candidate_union_topk):
-                    break
-            if len(ordered_union) >= int(self.args.factorized_candidate_union_topk):
-                break
-
-        branch_meta = {
-            "style_branch_ids": style_branch_ids,
-            "proto_branch_ids": proto_branch_ids,
-            "mmbert_branch_ids": mmbert_branch_ids,
-            "top_proto_ids": [int(x) for x in top_proto_ids],
-        }
-        return ordered_union, branch_meta
 
     def forward_eval_batch(
         self,
@@ -1008,10 +1017,8 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
                 f"Structured factorized eval currently expects batch_size=1, got {batch_size}."
             )
 
-        q_style, q_expr, style_usage_gate = self.encode_style_expr_queries(
-            input_ids, attention_mask
-        )
-        bank_all_h, style_bank_c, style_bank_a, proto_vectors, proto_density = (
+        q_style, q_expr = self.encode_style_expr_queries(input_ids, attention_mask)
+        bank_all_h, style_bank_c, style_bank_a, proto_vectors, _ = (
             self._get_eval_or_fresh_bank_factorization(device)
         )
 
@@ -1020,7 +1027,6 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
             candidate_ids = [int(x) for x in cands[0]]
             candidate_idx = torch.tensor(candidate_ids, dtype=torch.long, device=device)
             candidate_h = bank_all_h.index_select(0, candidate_idx)
-            candidate_c = style_bank_c.index_select(0, candidate_idx)
             candidate_a = style_bank_a.index_select(0, candidate_idx)
         else:
             if getattr(self.args, "candidate_eval_only", False) or getattr(
@@ -1029,7 +1035,6 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
                 raise ValueError(_CAND_EVAL_ONLY_ERR)
             candidate_ids = list(range(self.args.max_image_id))
             candidate_h = bank_all_h
-            candidate_c = style_bank_c
             candidate_a = style_bank_a
 
         img_num = candidate_h.size(0)
@@ -1043,68 +1048,31 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
             candidate_h=candidate_h,
         )
 
-        candidate_q_style = q_style.repeat(img_num, 1)
         candidate_q_expr = q_expr.repeat(img_num, 1)
-        style_score, expr_score = self._compute_candidate_factor_scores(
-            candidate_q_style, candidate_q_expr, candidate_c, candidate_a
-        )
+        expr_score = self.compute_expression_compatibility(candidate_q_expr, candidate_a)
 
         proto_logits_row = self._compute_proto_logits(q_style, proto_vectors).squeeze(0)
-        graph_score = self._gather_proto_scores_for_candidates(
-            proto_logits_row, proto_density, candidate_ids
-        )
+        graph_score = self._gather_proto_scores_for_candidates(proto_logits_row, candidate_ids)
 
-        union_ids, branch_meta = self._build_candidate_union(
-            candidate_ids=candidate_ids,
-            style_score=style_score,
-            mmbert_score=mmbert_score,
-            proto_logits_row=proto_logits_row,
-        )
-        candidate_to_idx = {int(sticker_id): idx for idx, sticker_id in enumerate(candidate_ids)}
-        union_idx = torch.tensor(
-            [candidate_to_idx[int(sticker_id)] for sticker_id in union_ids],
-            dtype=torch.long,
-            device=device,
-        )
-        union_fused = self._fuse_scores(
-            mmbert_score.index_select(0, union_idx),
-            style_score.index_select(0, union_idx),
-            expr_score.index_select(0, union_idx),
-            graph_score.index_select(0, union_idx),
-            style_usage_gate.repeat(union_idx.numel()),
-        )
-
-        fallback_floor = float(mmbert_score.detach().min().item()) - 100.0
-        final_score = mmbert_score.new_full((img_num,), fallback_floor)
-        final_score.index_copy_(0, union_idx, union_fused)
-
+        final_score = self._compute_final_score(mmbert_score, expr_score, graph_score)
         rank_scores = final_score.unsqueeze(0)
         labels = torch.tensor(img_ids, dtype=torch.long, device=device)
         if not return_debug:
             return rank_scores, labels, candidate_ids if use_cands else None
 
-        gold_id = int(img_ids[0])
         eval_debug = {
             "uses_factorized_ranking": True,
             "candidate_count": int(len(candidate_ids)),
-            "union_size": int(len(union_ids)),
-            "gold_in_union": bool(gold_id in set(union_ids)),
-            "gold_in_style_branch": bool(gold_id in set(branch_meta["style_branch_ids"])),
-            "gold_in_proto_branch": bool(gold_id in set(branch_meta["proto_branch_ids"])),
-            "gold_in_mmbert_branch": bool(gold_id in set(branch_meta["mmbert_branch_ids"])),
             "mmbert_score_stats": self._tensor_debug_stats(mmbert_score),
             "final_score_stats": self._tensor_debug_stats(final_score),
-            "style_score_stats": self._tensor_debug_stats(style_score),
             "expr_score_stats": self._tensor_debug_stats(expr_score),
             "graph_score_stats": self._tensor_debug_stats(graph_score),
-            "style_usage_gate_stats": self._tensor_debug_stats(style_usage_gate),
             "fused_minus_mmbert_abs_mean": float((final_score - mmbert_score).abs().mean().item()),
             "top1_flipped_vs_mmbert": bool(
                 torch.argmax(final_score).item() != torch.argmax(mmbert_score).item()
             ),
             "ranking_score_formula": (
-                "s_rank = FusionMLP([s_mmbert, s_style, s_expr, s_graph, g_use_style]) "
-                "after candidate union from style/prototype/mmbert branches"
+                "s_final = s_mmbert + lambda_expr * s_expr + lambda_style_proto * proto_logit[proto_id]"
             ),
         }
         return rank_scores, labels, candidate_ids if use_cands else None, eval_debug
@@ -1133,7 +1101,6 @@ class StructuredFactorizedPLModel(StructuredPLModel):
             self.id2name[int(k)] = v
 
         self._style_proto_acc_ema: Optional[float] = None
-        self._style_gate_ema: Optional[float] = None
         self._reset_eval_diagnostics()
 
     def _update_ema(self, old: Optional[float], value: float, alpha: float = 0.05) -> float:
@@ -1145,14 +1112,8 @@ class StructuredFactorizedPLModel(StructuredPLModel):
         self.eval_diag_count = 0
         self.eval_mmbert_score_std_sum = 0.0
         self.eval_final_score_std_sum = 0.0
-        self.eval_style_score_std_sum = 0.0
         self.eval_expr_score_std_sum = 0.0
         self.eval_graph_score_std_sum = 0.0
-        self.eval_union_size_sum = 0.0
-        self.eval_union_rate_sum = 0.0
-        self.eval_gold_in_union_count = 0
-        self.eval_gold_in_style_branch_count = 0
-        self.eval_gold_in_proto_branch_count = 0
         self.eval_top1_flip_count = 0
         self.eval_delta_abs_mean_sum = 0.0
 
@@ -1160,16 +1121,8 @@ class StructuredFactorizedPLModel(StructuredPLModel):
         self.eval_diag_count += 1
         self.eval_mmbert_score_std_sum += float(eval_debug["mmbert_score_stats"]["std"])
         self.eval_final_score_std_sum += float(eval_debug["final_score_stats"]["std"])
-        self.eval_style_score_std_sum += float(eval_debug["style_score_stats"]["std"])
         self.eval_expr_score_std_sum += float(eval_debug["expr_score_stats"]["std"])
         self.eval_graph_score_std_sum += float(eval_debug["graph_score_stats"]["std"])
-        self.eval_union_size_sum += float(eval_debug["union_size"])
-        self.eval_union_rate_sum += float(eval_debug["union_size"]) / max(
-            float(eval_debug["candidate_count"]), 1.0
-        )
-        self.eval_gold_in_union_count += int(bool(eval_debug["gold_in_union"]))
-        self.eval_gold_in_style_branch_count += int(bool(eval_debug["gold_in_style_branch"]))
-        self.eval_gold_in_proto_branch_count += int(bool(eval_debug["gold_in_proto_branch"]))
         self.eval_top1_flip_count += int(bool(eval_debug["top1_flipped_vs_mmbert"]))
         self.eval_delta_abs_mean_sum += float(eval_debug["fused_minus_mmbert_abs_mean"])
 
@@ -1180,14 +1133,8 @@ class StructuredFactorizedPLModel(StructuredPLModel):
         return {
             "mmbert_score_std": self.eval_mmbert_score_std_sum / denom,
             "final_score_std": self.eval_final_score_std_sum / denom,
-            "style_score_std": self.eval_style_score_std_sum / denom,
             "expr_score_std": self.eval_expr_score_std_sum / denom,
             "graph_score_std": self.eval_graph_score_std_sum / denom,
-            "union_size": self.eval_union_size_sum / denom,
-            "union_rate": self.eval_union_rate_sum / denom,
-            "gold_in_union_rate": self.eval_gold_in_union_count / denom,
-            "gold_in_style_branch_rate": self.eval_gold_in_style_branch_count / denom,
-            "gold_in_proto_branch_rate": self.eval_gold_in_proto_branch_count / denom,
             "top1_flip_rate": self.eval_top1_flip_count / denom,
             "delta_abs_mean": self.eval_delta_abs_mean_sum / denom,
         }
@@ -1200,16 +1147,14 @@ class StructuredFactorizedPLModel(StructuredPLModel):
         self.model.clear_train_factorization_cache()
         prof_lim = self.model._factorized_profile_limit()
         logger.info(
-            "[StructuredFactorized] style_recall_topk=%s proto_topk=%s proto_expand=%s "
-            "mmbert_branch_topk=%s union_topk=%s lambda_style_proto=%.3f train_bank_refresh=%s "
+            "[StructuredFactorized] lambda_style_proto=%.3f lambda_expr=%.3f lambda_orth=%.3f "
+            "proto_consistency_weight=%.3f train_bank_refresh=%s "
             "fused_train_mmbert=%s bert_grad_ckpt=%s train_mmbert_two_way=%s two_way_neg=%s "
-            "max_dialogue_length=%s profile_steps=%s",
-            self.args.factorized_style_recall_topk,
-            self.args.factorized_style_proto_topk,
-            self.args.factorized_proto_expand_per_proto,
-            self.args.factorized_mmbert_branch_topk,
-            self.args.factorized_candidate_union_topk,
+            "max_dialogue_length=%s profile_steps=%s (union/fusion knobs in config are unused in minimal core)",
             float(self.args.lambda_style_proto),
+            float(self.args.lambda_expr or 0.0),
+            float(self.args.lambda_orth or 0.0),
+            float(getattr(self.args, "factorized_proto_consistency_weight", 0.0) or 0.0),
             int(getattr(self.args, "factorized_train_bank_refresh_steps", 0) or 0),
             bool(getattr(self.args, "factorized_fused_train_mmbert", False)),
             bool(getattr(self.args, "bert_gradient_checkpointing", True)),
@@ -1225,9 +1170,8 @@ class StructuredFactorizedPLModel(StructuredPLModel):
                 prof_lim - 1,
             )
         logger.info(
-            "[StructuredFactorized] Ranking uses factorized candidate union "
-            "(style direct branch + prototype expansion + optional MM-BERT branch) "
-            "followed by a learned fusion head."
+            "[StructuredFactorized] Minimal core: additive final score on full candidates; "
+            "aux losses use fixed lambdas (no warmup / no stage scaling)."
         )
         return pl.LightningModule.on_train_start(self)
 
@@ -1252,61 +1196,43 @@ class StructuredFactorizedPLModel(StructuredPLModel):
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
         outputs = self.run_train_batch(batch)
-        structured_aux = self.args.lambda_struct * (
-            outputs.style_neighbor_loss + outputs.orth_loss
-        )
-        expr_aux = self.args.lambda_expr * outputs.expr_rank_loss
-        style_proto_aux = float(self.args.lambda_style_proto) * outputs.style_proto_loss
+        lp = float(self.args.lambda_style_proto or 0.0) * outputs.style_proto_loss
+        le = float(self.args.lambda_expr or 0.0) * outputs.expr_rank_loss
+        lo = float(self.args.lambda_orth or 0.0) * outputs.orth_loss
         if self.args.base_only:
-            structured_aux = structured_aux * 0.0
-            expr_aux = expr_aux * 0.0
-            style_proto_aux = style_proto_aux * 0.0
-        weighted_struct_aux = outputs.aux_warmup * structured_aux
-        weighted_expr_aux = outputs.aux_warmup * expr_aux
-        weighted_style_proto_aux = outputs.aux_warmup * style_proto_aux
+            lp = lp * 0.0
+            le = le * 0.0
+            lo = lo * 0.0
 
         self.log("train_loss", outputs.loss, prog_bar=False)
         self.log("train_match_loss", outputs.match_loss, prog_bar=False)
         self.log("train_style_proto_loss", outputs.style_proto_loss, prog_bar=False)
-        self.log("train_style_neighbor_loss", outputs.style_neighbor_loss, prog_bar=False)
         self.log("train_orth_loss", outputs.orth_loss, prog_bar=False)
         self.log("train_expr_rank_loss", outputs.expr_rank_loss, prog_bar=False)
-        self.log("train_aux_warmup", outputs.aux_warmup, prog_bar=False)
-        self.log("train_structured_aux", weighted_struct_aux, prog_bar=False)
-        self.log("train_expr_aux", weighted_expr_aux, prog_bar=False)
-        self.log("train_style_proto_aux", weighted_style_proto_aux, prog_bar=False)
+        self.log("train_style_proto_aux", lp, prog_bar=False)
+        self.log("train_expr_aux", le, prog_bar=False)
+        self.log("train_orth_aux", lo, prog_bar=False)
 
         ts_list: Optional[List[float]] = None
         proto_acc = 0.0
-        gate_mean = 0.0
         if outputs.debug_info is not None and "_train_scalars" in outputs.debug_info:
             ts_list = outputs.debug_info["_train_scalars"].detach().float().cpu().tolist()
             proto_acc = float(ts_list[0])
-            gate_mean = float(ts_list[1])
         self._style_proto_acc_ema = self._update_ema(self._style_proto_acc_ema, proto_acc)
-        self._style_gate_ema = self._update_ema(self._style_gate_ema, gate_mean)
 
         pb_full = self.args.train_prog_bar_mode == "full"
         dev = outputs.loss.device
         self.log("total", outputs.loss.detach(), prog_bar=True, logger=False)
         self.log("match", outputs.match_loss.detach(), prog_bar=True, logger=False)
         self.log("proto", outputs.style_proto_loss.detach(), prog_bar=True, logger=False)
-        self.log("style", outputs.style_neighbor_loss.detach(), prog_bar=pb_full, logger=False)
         self.log("orth", outputs.orth_loss.detach(), prog_bar=pb_full, logger=False)
         self.log("expr", outputs.expr_rank_loss.detach(), prog_bar=pb_full, logger=False)
-        self.log("saux", weighted_struct_aux.detach(), prog_bar=pb_full, logger=False)
-        self.log("eaux", weighted_expr_aux.detach(), prog_bar=pb_full, logger=False)
-        self.log("paux", weighted_style_proto_aux.detach(), prog_bar=pb_full, logger=False)
-        self.log("wt", outputs.aux_warmup.detach(), prog_bar=pb_full, logger=False)
+        self.log("paux", lp.detach(), prog_bar=pb_full, logger=False)
+        self.log("eaux", le.detach(), prog_bar=pb_full, logger=False)
+        self.log("oaux", lo.detach(), prog_bar=pb_full, logger=False)
         self.log(
             "pacc",
             torch.tensor(self._style_proto_acc_ema, device=dev, dtype=torch.float32),
-            prog_bar=True,
-            logger=False,
-        )
-        self.log(
-            "gate",
-            torch.tensor(self._style_gate_ema, device=dev, dtype=torch.float32),
             prog_bar=True,
             logger=False,
         )
@@ -1319,14 +1245,13 @@ class StructuredFactorizedPLModel(StructuredPLModel):
             and ts_list is not None
         ):
             logger.info(
-                "[StructuredFactorizedTrain] step=%d proto_acc=%.4f gate=%.4f "
-                "cross_neg=%s same_neg=%s margin=%.4f",
+                "[StructuredFactorizedTrain] step=%d proto_acc=%.4f margin_pos_minus_same=%.4f "
+                "cross_neg=%s same_neg=%s",
                 int(self.global_step),
                 float(ts_list[0]),
                 float(ts_list[1]),
                 outputs.debug_info["cross_neg_ids_preview"],
                 outputs.debug_info["same_neg_ids_preview"],
-                float(ts_list[2]),
             )
 
         return outputs.loss
@@ -1361,14 +1286,8 @@ class StructuredFactorizedPLModel(StructuredPLModel):
                 f"n_batches={self.eval_diag_count} "
                 f"mmbert_std={diag['mmbert_score_std']:.4f} "
                 f"rank_std={diag['final_score_std']:.4f} "
-                f"style_std={diag['style_score_std']:.4f} "
                 f"expr_std={diag['expr_score_std']:.4f} "
                 f"graph_std={diag['graph_score_std']:.4f} "
-                f"union_size={diag['union_size']:.2f} "
-                f"union_rate={diag['union_rate']:.4f} "
-                f"gold_union={diag['gold_in_union_rate']:.4f} "
-                f"gold_style={diag['gold_in_style_branch_rate']:.4f} "
-                f"gold_proto={diag['gold_in_proto_branch_rate']:.4f} "
                 f"delta_abs={diag['delta_abs_mean']:.4f} "
                 f"top1_flip={diag['top1_flip_rate']:.4f}"
             )
@@ -1404,6 +1323,7 @@ def run_structured_factorized_main(args: StructuredFactorizedArguments) -> None:
             trainer.fit(model, datamodule=datamodule, ckpt_path=args.ckpt_path)
         else:
             trainer.fit(model, datamodule=datamodule)
+        save_final_checkpoint_from_trainer(trainer, args)
         return
 
     if args.mode in {"test", "gen"}:

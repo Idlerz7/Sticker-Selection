@@ -48,3 +48,8 @@ residual_init_gain: 0.1
 
 train_score_decomp_log_interval: 200
 train_prog_bar_mode: compact
+
+# Multi-GPU + BERT gradient checkpoint: one forward uses bert.bert (query) and 2× full BERT (pos/neg).
+# DDP otherwise raises "Expected to mark a variable ready only once"; static graph is the PT-recommended fix.
+ddp_static_graph_callback: true
+ddp_find_unused_parameters: false

@@ -48,11 +48,14 @@ class FactorizedPrototype:
     proto_key: str
     proto_source: str
     member_ids: List[int]
-    main_subject: str
-    subject_category: str
-    visual_style: str
-    identity_summary: str
-    proto_density: float
+    member_count: int = 0
+    main_subject: str = ""
+    subject_category: str = ""
+    visual_style: str = ""
+    identity_summary: str = ""
+    proto_density: float = 0.0
+    neighbor_coverage: float = 0.0
+    style_consistency: float = 0.0
 
 
 def _read_json(path: str) -> Any:
@@ -136,6 +139,42 @@ def _pick_majority_text(values: Iterable[str], fallback: str = "") -> str:
     if not cleaned:
         return fallback
     return Counter(cleaned).most_common(1)[0][0]
+
+
+def _majority_ratio(values: Iterable[str]) -> float:
+    cleaned = [x for x in values if x]
+    if not cleaned:
+        return 0.0
+    top = Counter(cleaned).most_common(1)[0][1]
+    return float(top) / float(len(cleaned))
+
+
+def _compute_label_consistency(proto_labels: Sequence[Mapping[str, str]]) -> float:
+    ratios = [
+        _majority_ratio(x.get("main_subject", "") for x in proto_labels),
+        _majority_ratio(x.get("subject_category", "") for x in proto_labels),
+        _majority_ratio(x.get("visual_style", "") for x in proto_labels),
+    ]
+    valid = [x for x in ratios if x > 0.0]
+    if not valid:
+        return 0.0
+    return float(sum(valid) / len(valid))
+
+
+def _compute_neighbor_coverage(
+    member_ids: Sequence[int], neighbors: Mapping[int, Sequence[int]]
+) -> float:
+    member_set = set(int(x) for x in member_ids)
+    coverages: List[float] = []
+    for sticker_id in member_ids:
+        raw_neighbors = [int(x) for x in neighbors.get(int(sticker_id), []) if int(x) != int(sticker_id)]
+        if not raw_neighbors:
+            continue
+        in_group = sum(1 for x in raw_neighbors if x in member_set)
+        coverages.append(float(in_group) / float(len(raw_neighbors)))
+    if not coverages:
+        return 0.0
+    return float(sum(coverages) / len(coverages))
 
 
 def _build_fine_key(label: Mapping[str, str]) -> str:
@@ -225,6 +264,7 @@ def build_factorized_style_bank_dict(
             "proto_key": proto_key,
             "proto_source": proto_source_by_sticker[member_ids[0]],
             "member_ids": member_ids,
+            "member_count": len(member_ids),
             "main_subject": _pick_majority_text(x.get("main_subject", "") for x in proto_labels),
             "subject_category": _pick_majority_text(
                 x.get("subject_category", "") for x in proto_labels
@@ -234,6 +274,8 @@ def build_factorized_style_bank_dict(
                 x.get("identity_summary", "") for x in proto_labels
             ),
             "proto_density": proto_density,
+            "neighbor_coverage": _compute_neighbor_coverage(member_ids, neighbors),
+            "style_consistency": _compute_label_consistency(proto_labels),
         }
         prototypes.append(prototype)
 
@@ -311,11 +353,14 @@ def build_factorized_style_bank_from_style_metadata(
                 "proto_key": f"img_set::{img_set}",
                 "proto_source": "img_set",
                 "member_ids": member_ids,
+                "member_count": len(member_ids),
                 "main_subject": f"set_{img_set}",
                 "subject_category": "stickerchat_pack",
                 "visual_style": f"pack_{img_set}",
                 "identity_summary": f"{len(member_ids)} stickers from set {img_set}",
                 "proto_density": proto_density,
+                "neighbor_coverage": _compute_neighbor_coverage(member_ids, neighbors),
+                "style_consistency": 1.0,
             }
         )
 
@@ -429,6 +474,18 @@ class FactorizedStyleBank:
 
     def proto_density(self, proto_id: int) -> float:
         return float(self.proto_to_record[int(proto_id)].proto_density)
+
+    def proto_style_consistency(self, proto_id: int) -> float:
+        return float(self.proto_to_record[int(proto_id)].style_consistency)
+
+    def proto_neighbor_coverage(self, proto_id: int) -> float:
+        return float(self.proto_to_record[int(proto_id)].neighbor_coverage)
+
+    def proto_member_count(self, proto_id: int) -> int:
+        record = self.proto_to_record[int(proto_id)]
+        if int(record.member_count) > 0:
+            return int(record.member_count)
+        return len(record.member_ids)
 
     def members_of_proto(self, proto_id: int) -> List[int]:
         return list(self.proto_to_members.get(int(proto_id), []))

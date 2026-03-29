@@ -1,6 +1,6 @@
-# Shared defaults for Structured Factorized V4.
-# This line promotes style/expression decomposition into the retrieval topology:
-# style/prototypes build the candidate union, then a learned fusion head reranks.
+# Shared defaults for Structured Factorized.
+# Runtime behavior is the minimal core in structured_retrieval_factorized.py:
+# additive scores on full candidates; union/fusion-related keys below are legacy YAML only.
 
 name: structured_factorized_base
 description: "Shared MM-BERT + style/expression factorized retrieval recipe."
@@ -47,7 +47,12 @@ max_dialogue_length: 490
 # factorized_train_mmbert_two_way: false
 # factorized_train_two_way_neg: same
 epochs: 10
-gradient_accumulation_steps: 2
+# Match structured_residual/_base and typical working CLI: accum>1 can hit DDP+BERT-checkpoint
+# edge cases (first optimizer step after N micro-batches) on older transformers/torch stacks.
+gradient_accumulation_steps: 1
+# Explicit false: avoid default find_unused_parameters=True traversal with deep factorized graph
+# (query BERT + up to 3× MM-BERT + fusion); pairs better with config-only gradient checkpointing.
+ddp_find_unused_parameters: false
 
 factorized_style_recall_topk: 32
 factorized_style_proto_topk: 4
@@ -58,9 +63,25 @@ factorized_use_mmbert_branch: true
 factorized_eval_compare_mmbert: true
 factorized_fusion_hidden_dim: 32
 factorized_proto_logit_scale: 10.0
+factorized_proto_consistency_weight: 0.0
 factorized_log_interval: 200
 
 train_same_proto_negatives: 1
 train_cross_proto_negatives: 1
 
+# Optional two-stage training schedule for the final paper model:
+# stage1 emphasizes decomposition/prototype organization; stage2 emphasizes ranking.
+factorized_stage1_ratio: 0.0
+factorized_stage1_struct_scale: 1.0
+factorized_stage1_expr_scale: 1.0
+factorized_stage1_style_proto_scale: 1.0
+factorized_stage2_struct_scale: 1.0
+factorized_stage2_expr_scale: 1.0
+factorized_stage2_style_proto_scale: 1.0
+
 train_prog_bar_mode: compact
+
+# BERT gradient checkpointing stays on (factorized does 3× MM-BERT / step; VRAM heavy without it).
+# Default ddp_static_graph_callback=false: do not pair DdpStaticGraphCallback with transformers 4.10
+# config-only checkpointing (avoids rare run_backward NULL on multi-GPU). Upgrade transformers or set
+# ddp_static_graph_callback: true if you need the callback for your stack.

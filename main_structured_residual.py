@@ -13,6 +13,14 @@ import sys
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
+# setuptools>=60: vendored distutils needs distutils.version loaded before PL/tensorboard.
+# Inline here so a stale clone still works; see also distutils_tensorboard_shim.py.
+from setuptools import distutils as _distutils_tb_workaround  # noqa: F401
+
+import distutils.version  # noqa: F401
+
+import distutils_tensorboard_shim  # noqa: F401
+
 from structured_retrieval_residual import (
     parse_structured_residual_args,
     run_structured_residual_main,
@@ -35,6 +43,7 @@ def _should_dispatch_factorized(argv) -> bool:
         "--factorized_style_recall_topk",
         "--factorized_use_mmbert_branch",
         "--lambda_style_proto",
+        "--lambda_orth",
         "--train_cross_proto_negatives",
         "--train_same_proto_negatives",
     }

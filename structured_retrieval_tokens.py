@@ -10,6 +10,8 @@ import yaml
 # (must be set before importing pytorch_lightning/tensorboard).
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
+import distutils_tensorboard_shim  # noqa: F401
+
 import pytorch_lightning as pl
 import torch
 from torch import nn
@@ -179,6 +181,7 @@ class StructuredTokenStickerModel(StructuredStickerModel):
         attention_mask: torch.Tensor,
         img_emb: torch.Tensor,
         img_ids: Sequence[int],
+        dialogue_q: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = text_emb.device
         batch_size = img_emb.size(0)

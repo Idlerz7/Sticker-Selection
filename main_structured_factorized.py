@@ -7,11 +7,14 @@ This line uses a two-stage style/expression retriever:
 
 Run (example):
   python main_structured_factorized.py --config configs/structured_factorized/v4_01_style_expr_two_stage.yaml
+  python main_structured_factorized.py --config configs/structured_factorized/v5_00_factorized_sed_final.yaml
 """
 
 import os
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
+import distutils_tensorboard_shim  # noqa: F401
 
 from structured_retrieval_factorized import (
     parse_structured_factorized_args,

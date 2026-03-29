@@ -1,0 +1,20 @@
+# StickerChat + factorized minimal core (single config; no multi --config merge).
+# Data / bank / paths: stickerchat_base.yaml
+# Method: additive full-candidate ranking — see structured_retrieval_factorized.py
+extends: stickerchat_base.yaml
+
+name: stickerchat_v6_minimal_core
+description: >
+  StickerChat with paper minimal core: MMBERT + sticker decomposition + prototype prior.
+  s_final = s_mmbert + lambda_expr * s_expr + lambda_style_proto * proto_logit[proto_id].
+  No union recall, fusion MLP, query gate, or proto-density weighting.
+
+pl_root_dir: logs/stickerchat_factorized_v6_minimal_core
+
+base_only: false
+
+lambda_expr: 0.3
+lambda_style_proto: 0.4
+lambda_orth: 0.5
+
+# Union / fusion-related keys inherited from _base are unused at runtime in minimal core.
