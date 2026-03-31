@@ -1,0 +1,7 @@
+extends: stickerchat_v6_minimal_core.yaml
+name: stickerchat_v6_low_proto
+description: "StickerChat minimal core with conservative prototype weight."
+pl_root_dir: logs/stickerchat_factorized_v6_low_proto
+
+lambda_expr: 0.3
+lambda_style_proto: 0.1

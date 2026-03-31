@@ -1,0 +1,13 @@
+extends: stickerchat_regroup_v2_aggressive_base.yaml
+name: stickerchat_v6_minimal_regroup_v2_aggressive
+description: >
+  StickerChat minimal core with aggressive regrouped styles (v2 aggressive assets).
+  Build: ./stickerchat/processed_style_regroup_v2_aggressive/
+pl_root_dir: logs/stickerchat_factorized_v6_minimal_regroup_v2_aggressive
+
+factorized_variant: minimal
+base_only: false
+
+lambda_expr: 0.3
+lambda_style_proto: 0.4
+lambda_orth: 0.5

@@ -1,0 +1,8 @@
+extends: stickerchat_v6_minimal_core.yaml
+name: stickerchat_v6_minimal_train_freq_ge8
+description: >
+  Same as stickerchat_v6_minimal_core but train on frequency-filtered JSON (build with
+  scripts/filter_stickerchat_train_by_frequency.py --min-frequency 8).
+pl_root_dir: logs/stickerchat_factorized_v6_minimal_train_freq_ge8
+
+train_data_path: ./stickerchat/processed/release_train_u_sticker_format_int_freq_ge_8.json

@@ -1,9 +1,11 @@
-extends: _base.yaml
-name: v5_00_factorized_sed_final
-description: "Final paper model: sticker-side style/expression decomposition with prototype-aware group reasoning and full two-stage reranking."
-pl_root_dir: logs/structured_factorized_v5_00_factorized_sed_final
-factorized_variant: full
+extends: stickerchat_base.yaml
+name: stickerchat_v7_full_model
+description: >
+  StickerChat performance-oriented factorized model: two-stage candidate union plus learned fusion reranker,
+  staged auxiliary training, and prototype-aware reasoning on top of MM-BERT.
+pl_root_dir: logs/stickerchat_factorized_v7_full_model
 
+factorized_variant: full
 base_only: false
 factorized_use_mmbert_branch: true
 

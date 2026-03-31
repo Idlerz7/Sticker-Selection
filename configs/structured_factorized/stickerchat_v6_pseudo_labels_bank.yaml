@@ -1,0 +1,12 @@
+extends: stickerchat_v6_minimal_core.yaml
+name: stickerchat_v6_pseudo_labels_bank
+description: >
+  StickerChat minimal core with DSTC-style pseudo-label bank (fine/coarse/singleton prototypes).
+  1) Produce JSONL with pseudo_label_stickers.py (same schema as DSTC).
+  2) python scripts/build_stickerchat_factorized_bank.py --bank-source pseudo_labels --output-path ./stickerchat/processed/factorized_style_bank_pseudo.json
+  3) Train with this config (points bank + pseudo path below).
+pl_root_dir: logs/stickerchat_factorized_v6_pseudo_labels_bank
+
+factorized_bank_source: pseudo_labels
+factorized_pseudo_label_path: ./stickerchat/processed/stickerchat_pseudo_labels.jsonl
+factorized_bank_path: ./stickerchat/processed/factorized_style_bank_pseudo.json

@@ -1,0 +1,7 @@
+extends: stickerchat_v6_minimal_core.yaml
+name: stickerchat_v6_proto_only
+description: "StickerChat minimal-core ablation: MM-BERT + prototype prior only."
+pl_root_dir: logs/stickerchat_factorized_v6_proto_only
+
+lambda_expr: 0.0
+lambda_style_proto: 0.4

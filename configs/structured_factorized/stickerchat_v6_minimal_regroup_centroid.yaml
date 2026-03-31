@@ -1,0 +1,13 @@
+extends: stickerchat_regroup_centroid_base.yaml
+name: stickerchat_v6_minimal_regroup_centroid
+description: >
+  StickerChat minimal core with CLIP-centroid regrouped styles. Use after building
+  ./stickerchat/processed_style_regroup_centroid assets.
+pl_root_dir: logs/stickerchat_factorized_v6_minimal_regroup_centroid
+
+factorized_variant: minimal
+base_only: false
+
+lambda_expr: 0.3
+lambda_style_proto: 0.4
+lambda_orth: 0.5

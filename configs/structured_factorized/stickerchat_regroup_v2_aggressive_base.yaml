@@ -1,0 +1,16 @@
+extends: stickerchat_base.yaml
+name: stickerchat_regroup_v2_aggressive_base
+description: >
+  StickerChat factorized retrieval with aggressive CLIP-centroid regrouped style groups
+  (merge_threshold=0.88, reciprocal_topk=4, split_large_packs_over=0).
+  Assets: ./stickerchat/processed_style_regroup_v2_aggressive/ from
+  scripts/build_stickerchat_style_regroup_assets.py.
+
+train_data_path: ./stickerchat/processed_style_regroup_v2_aggressive/release_train_u_sticker_format_int.json
+per_epoch_eval_test_r10_path: ./stickerchat/processed_style_regroup_v2_aggressive/release_test_u_sticker_format_int_with_cand_r10.json
+per_epoch_eval_test_r20_path: ./stickerchat/processed_style_regroup_v2_aggressive/release_test_u_sticker_format_int_with_cand_r20.json
+test_data_path: ./stickerchat/processed_style_regroup_v2_aggressive/release_test_u_sticker_format_int_with_cand_r10.json
+
+style_neighbors_path: ./stickerchat/processed_style_regroup_v2_aggressive/style_neighbors.json
+factorized_bank_path: ./stickerchat/processed_style_regroup_v2_aggressive/factorized_style_bank.json
+factorized_style_metadata_path: ./stickerchat/processed_style_regroup_v2_aggressive/sticker_metadata.json

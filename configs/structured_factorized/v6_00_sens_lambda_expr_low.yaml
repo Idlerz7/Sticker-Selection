@@ -1,0 +1,7 @@
+extends: v6_00_minimal_core.yaml
+name: v6_00_sens_lambda_expr_low
+description: >
+  Sensitivity: lambda_expr=0.15 (below default 0.3). lambda_style_proto=0.4, lambda_orth=0.5 unchanged.
+pl_root_dir: logs/structured_factorized_v6_00_sens_lambda_expr_low
+
+lambda_expr: 0.15

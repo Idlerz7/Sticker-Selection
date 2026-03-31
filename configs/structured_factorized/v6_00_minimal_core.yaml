@@ -5,6 +5,7 @@ description: >
   Additive final score on the full candidate set (no union recall, no fusion MLP, no query gate, no proto-density weighting).
 pl_root_dir: logs/structured_factorized_v6_00_minimal_core
 
+factorized_variant: minimal
 base_only: false
 
 # Scoring: s_final = s_mmbert + lambda_expr * s_expr + lambda_style_proto * proto_logit[proto_id]

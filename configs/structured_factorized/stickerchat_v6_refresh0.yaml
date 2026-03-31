@@ -1,0 +1,6 @@
+extends: stickerchat_v6_minimal_core.yaml
+name: stickerchat_v6_refresh0
+description: "StickerChat minimal core with exact per-step bank refresh."
+pl_root_dir: logs/stickerchat_factorized_v6_refresh0
+
+factorized_train_bank_refresh_steps: 0

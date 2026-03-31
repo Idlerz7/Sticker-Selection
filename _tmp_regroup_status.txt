@@ -1,0 +1,7 @@
+exists summary: False
+files: ['factorized_style_bank.json', 'img_set_to_ids.json', 'release_train_u_sticker_format_int.json', 'sticker_metadata.json', 'style_neighbors.json', 'style_regroup_analysis.json']
+train_bytes: 87649130
+pgrep: 1166737
+1166751
+1288571
+1288572

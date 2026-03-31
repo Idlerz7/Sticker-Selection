@@ -1,0 +1,7 @@
+extends: v6_00_minimal_core.yaml
+name: v6_00_sens_lambda_expr_0
+description: >
+  Sensitivity: lambda_expr=0 (no expressive term weight in s_final). lambda_style_proto=0.4, lambda_orth=0.5 unchanged.
+pl_root_dir: logs/structured_factorized_v6_00_sens_lambda_expr_0
+
+lambda_expr: 0.0

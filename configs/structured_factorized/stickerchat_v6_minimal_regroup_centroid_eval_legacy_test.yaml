@@ -1,0 +1,12 @@
+extends: stickerchat_v6_minimal_regroup_centroid.yaml
+name: stickerchat_v6_minimal_regroup_centroid_eval_legacy_test
+description: >
+  Same as stickerchat_v6_minimal_regroup_centroid (train/val/bank from regroup), but
+  per-epoch eval uses the original stickerchat/processed/ R10/R20 test JSONs so metrics
+  are comparable to older runs that did not use regroup.
+pl_root_dir: logs/stickerchat_factorized_v6_minimal_regroup_centroid_legacy_test
+
+# Legacy benchmark (same candidate lists as pre-regroup experiments)
+per_epoch_eval_test_r10_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json
+per_epoch_eval_test_r20_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r20.json
+test_data_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json

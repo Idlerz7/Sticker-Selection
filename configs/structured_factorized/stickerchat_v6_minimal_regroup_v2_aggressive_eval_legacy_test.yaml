@@ -1,0 +1,11 @@
+extends: stickerchat_v6_minimal_regroup_v2_aggressive.yaml
+name: stickerchat_v6_minimal_regroup_v2_aggressive_eval_legacy_test
+description: >
+  Same as stickerchat_v6_minimal_regroup_v2_aggressive (train/bank from v2 aggressive),
+  but per-epoch eval uses original stickerchat/processed/ R10/R20 test JSONs for
+  comparability with MMBERT and legacy-processed runs.
+pl_root_dir: logs/stickerchat_factorized_v6_minimal_regroup_v2_aggressive_legacy_test
+
+per_epoch_eval_test_r10_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json
+per_epoch_eval_test_r20_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r20.json
+test_data_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json

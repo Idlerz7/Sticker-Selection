@@ -11,6 +11,7 @@ description: >
 
 pl_root_dir: logs/stickerchat_factorized_v6_minimal_core
 
+factorized_variant: minimal
 base_only: false
 
 lambda_expr: 0.3

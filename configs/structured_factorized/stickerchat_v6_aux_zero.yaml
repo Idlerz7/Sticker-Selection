@@ -1,0 +1,11 @@
+extends: stickerchat_v6_minimal_core.yaml
+name: stickerchat_v6_aux_zero
+description: >
+  StickerChat minimal-core ablation: only L_match (lambda_expr/lambda_style_proto/lambda_orth = 0).
+  Scoring at eval is mmbert-only; use for short runs vs stickerchat_v6_base_only (same ranking, different training path).
+pl_root_dir: logs/stickerchat_factorized_v6_aux_zero
+
+base_only: false
+lambda_expr: 0.0
+lambda_style_proto: 0.0
+lambda_orth: 0.0

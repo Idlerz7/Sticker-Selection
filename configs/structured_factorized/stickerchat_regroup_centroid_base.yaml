@@ -1,0 +1,14 @@
+extends: stickerchat_base.yaml
+name: stickerchat_regroup_centroid_base
+description: >
+  StickerChat factorized retrieval with CLIP-centroid regrouped style groups instead of raw img_set.
+  Assets are produced by scripts/build_stickerchat_style_regroup_assets.py.
+
+train_data_path: ./stickerchat/processed_style_regroup_centroid/release_train_u_sticker_format_int.json
+per_epoch_eval_test_r10_path: ./stickerchat/processed_style_regroup_centroid/release_test_u_sticker_format_int_with_cand_r10.json
+per_epoch_eval_test_r20_path: ./stickerchat/processed_style_regroup_centroid/release_test_u_sticker_format_int_with_cand_r20.json
+test_data_path: ./stickerchat/processed_style_regroup_centroid/release_test_u_sticker_format_int_with_cand_r10.json
+
+style_neighbors_path: ./stickerchat/processed_style_regroup_centroid/style_neighbors.json
+factorized_bank_path: ./stickerchat/processed_style_regroup_centroid/factorized_style_bank.json
+factorized_style_metadata_path: ./stickerchat/processed_style_regroup_centroid/sticker_metadata.json

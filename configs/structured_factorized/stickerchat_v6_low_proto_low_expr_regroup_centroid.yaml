@@ -1,0 +1,10 @@
+extends: stickerchat_v6_minimal_regroup_centroid.yaml
+name: stickerchat_v6_low_proto_low_expr_regroup_centroid
+description: >
+  Same regroup data/assets as stickerchat_v6_minimal_regroup_centroid, but smaller
+  lambda_expr and lambda_style_proto so additive eval terms disturb MMBERT ranking less
+  (P1 in Factorized vs MMBERT gap plan). Compare against full-lambda regroup runs.
+pl_root_dir: logs/stickerchat_factorized_v6_low_proto_low_expr_regroup_centroid
+
+lambda_expr: 0.2
+lambda_style_proto: 0.1

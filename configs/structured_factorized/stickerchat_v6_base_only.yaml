@@ -1,0 +1,6 @@
+extends: stickerchat_v6_minimal_core.yaml
+name: stickerchat_v6_base_only
+description: "StickerChat minimal-core ablation: MM-BERT only."
+pl_root_dir: logs/stickerchat_factorized_v6_base_only
+
+base_only: true

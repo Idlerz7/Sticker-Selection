@@ -1,0 +1,6 @@
+extends: stickerchat_v6_minimal_regroup_centroid.yaml
+name: stickerchat_v6_base_only_regroup_centroid
+description: "StickerChat regrouped-style ablation: MM-BERT only."
+pl_root_dir: logs/stickerchat_factorized_v6_base_only_regroup_centroid
+
+base_only: true
