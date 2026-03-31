@@ -1,0 +1,9 @@
+extends: v6_00_minimal_core.yaml
+name: v6_00_ablate_no_style_proto
+description: >
+  Ablation: disable prototype-level stylistic supervision (style_proto / proto CE loss) via lambda_style_proto=0.
+  Keeps expr rank loss and orth loss at v6 minimal-core strengths.
+pl_root_dir: logs/structured_factorized_v6_00_ablate_no_style_proto
+
+lambda_style_proto: 0.0
+# lambda_expr / lambda_orth inherited from v6_00_minimal_core (0.3 / 0.5)
