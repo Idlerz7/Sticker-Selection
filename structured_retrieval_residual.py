@@ -26,6 +26,7 @@ from structured_retrieval import (
     _CAND_EVAL_ONLY_ERR,
     attach_per_epoch_dual_test_eval,
     build_trainer,
+    effective_lambda_expr_rank_loss_weight,
     load_checkpoint_to_model,
     nonempty_batch_cands,
 )
@@ -513,7 +514,7 @@ class StructuredResidualPLModel(StructuredPLModel):
         structured_aux = self.args.lambda_struct * (
             outputs.style_neighbor_loss + outputs.orth_loss
         )
-        expr_aux = self.args.lambda_expr * outputs.expr_rank_loss
+        expr_aux = effective_lambda_expr_rank_loss_weight(self.args) * outputs.expr_rank_loss
         if self.args.base_only:
             structured_aux = structured_aux * 0.0
             expr_aux = expr_aux * 0.0

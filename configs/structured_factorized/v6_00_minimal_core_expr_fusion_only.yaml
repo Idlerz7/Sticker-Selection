@@ -1,0 +1,12 @@
+extends: v6_00_minimal_core.yaml
+name: v6_00_minimal_core_expr_fusion_only
+description: >
+  Same as v6_00_minimal_core, but expr *rank* auxiliary loss is off (lambda_expr_rank_loss=0).
+  Additive score still uses lambda_expr on s_expr: s_final = s_mmbert + lambda_expr * s_expr + ...
+pl_root_dir: logs/structured_factorized_v6_00_minimal_core_expr_fusion_only
+
+# Fusion / eval (unchanged from minimal core)
+lambda_expr: 0.3
+
+# Train: no gradient from expr_rank_loss; fusion & expr heads still trained via match_loss + other aux
+lambda_expr_rank_loss: 0

@@ -35,6 +35,7 @@ from structured_retrieval import (
     _CAND_EVAL_ONLY_ERR,
     attach_per_epoch_dual_test_eval,
     build_trainer,
+    effective_lambda_expr_rank_loss_weight,
     load_checkpoint_to_model,
     maybe_set_ddp_static_graph,
     nonempty_batch_cands,
@@ -1238,7 +1239,11 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
                 * self.args.lambda_struct
                 * (style_neighbor_loss + orth_loss)
             )
-            expr_aux = float(train_scales.expr_scale) * self.args.lambda_expr * expr_rank_loss
+            expr_aux = (
+                float(train_scales.expr_scale)
+                * effective_lambda_expr_rank_loss_weight(self.args)
+                * expr_rank_loss
+            )
             style_proto_aux = (
                 float(train_scales.style_proto_scale)
                 * float(self.args.lambda_style_proto)
@@ -1255,7 +1260,7 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
             orth_loss = self.compute_orth_loss(pos_c, pos_a)
             expr_rank_loss = self.compute_expr_rank_loss(pos_expr, same_expr)
             lp = float(self.args.lambda_style_proto or 0.0) * style_proto_loss
-            le = float(self.args.lambda_expr or 0.0) * expr_rank_loss
+            le = effective_lambda_expr_rank_loss_weight(self.args) * expr_rank_loss
             lo = float(self.args.lambda_orth or 0.0) * orth_loss
             if self.args.base_only:
                 lp = lp * 0.0
@@ -1652,6 +1657,13 @@ class StructuredFactorizedPLModel(StructuredPLModel):
                 "[StructuredFactorized] Minimal core: additive final score on full candidates; "
                 "aux losses use fixed lambdas (no warmup / no stage scaling)."
             )
+            if getattr(self.args, "lambda_expr_rank_loss", None) is not None:
+                logger.info(
+                    "[StructuredFactorized] lambda_expr_rank_loss=%.4f weights expr-rank aux only; "
+                    "additive fusion still uses lambda_expr=%.4f",
+                    effective_lambda_expr_rank_loss_weight(self.args),
+                    float(self.args.lambda_expr or 0.0),
+                )
         return pl.LightningModule.on_train_start(self)
 
     def run_train_batch(self, batch: Dict[str, Any]) -> StructuredFactorizedForwardOutput:
@@ -1679,7 +1691,11 @@ class StructuredFactorizedPLModel(StructuredPLModel):
             structured_aux = outputs.structured_scale * self.args.lambda_struct * (
                 outputs.style_neighbor_loss + outputs.orth_loss
             )
-            expr_aux = outputs.expr_scale * self.args.lambda_expr * outputs.expr_rank_loss
+            expr_aux = (
+                outputs.expr_scale
+                * effective_lambda_expr_rank_loss_weight(self.args)
+                * outputs.expr_rank_loss
+            )
             style_proto_aux = (
                 outputs.style_proto_scale * float(self.args.lambda_style_proto) * outputs.style_proto_loss
             )
@@ -1764,7 +1780,7 @@ class StructuredFactorizedPLModel(StructuredPLModel):
                 )
         else:
             lp = float(self.args.lambda_style_proto or 0.0) * outputs.style_proto_loss
-            le = float(self.args.lambda_expr or 0.0) * outputs.expr_rank_loss
+            le = effective_lambda_expr_rank_loss_weight(self.args) * outputs.expr_rank_loss
             lo = float(self.args.lambda_orth or 0.0) * outputs.orth_loss
             if self.args.base_only:
                 lp = lp * 0.0
