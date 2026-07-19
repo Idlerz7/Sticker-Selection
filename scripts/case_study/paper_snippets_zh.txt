@@ -1,0 +1,16 @@
+【可直接粘贴到论文实验部分 Case Study 小节】
+
+（1）筛选规则说明（1–2 句）
+我们在与主表相同的验证协议下（同一候选集 R@10、同一 checkpoint），将「基线」定义为仅使用 MMBERT 分支得分的排序（eval 时 base_only=true），将「完整模型」定义为融合表情/原型等项后的排序（base_only=false）。主案例池由满足「基线 Top-1 不等于真实标签且完整模型 Top-1 等于真实标签」的样本构成；展示用案例自该池中按 dialogue_id 分层抽样得到，以避免多个案例来自同一段对话。Case study 用于直观展示典型错误模式与改进方向，不替代主表中的总体检索指标。
+
+（2）与主表指标的关系（1 句）
+表中 R@K / MRR 等仍为论文主结论；本节案例分析为定性补充。
+
+（3）可选：局限性（1 句）
+我们同时报告至少一个「完整模型错误而基线正确」或「双方均错」的样例，以说明改进并非来自刻意挑选。可从 mine_case_study_pool.py 输出的 secondary_pools.json 中选取 ours_wrong_baseline_right 或 both_wrong 的索引，并在 export_case_study_assets.py 中使用 --extra_indices 行号导出同一套分数与配图。
+
+---
+
+【英文版本 / English】
+
+We analyze qualitative cases under the same validation protocol as the main metrics (same R@10 candidates and checkpoint). The baseline ranks candidates using MMBERT-only scores (evaluation with base_only=true), while our full model uses the fused scoring function (base_only=false). The primary pool consists of examples where the baseline top-1 is incorrect while the full model’s top-1 matches the ground-truth sticker. Shown cases are drawn from this pool with stratified sampling (at most one case per dialogue id) to reduce redundancy. Case studies are illustrative and do not replace aggregate R@K / MRR in the main tables.

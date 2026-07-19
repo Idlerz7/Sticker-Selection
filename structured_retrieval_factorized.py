@@ -1376,6 +1376,7 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         img_ids: Sequence[int],
         cands: Optional[Sequence[Sequence[int]]] = None,
         return_debug: bool = False,
+        score_breakdown: bool = False,
     ):
         device = input_ids.device
         batch_size = input_ids.size(0)
@@ -1458,7 +1459,7 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
             final_score = self._compute_final_score(mmbert_score, expr_score, graph_score)
         rank_scores = final_score.unsqueeze(0)
         labels = torch.tensor(img_ids, dtype=torch.long, device=device)
-        if not return_debug:
+        if not return_debug and not score_breakdown:
             return rank_scores, labels, candidate_ids if use_cands else None
 
         if self.uses_full_variant():
@@ -1502,6 +1503,17 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
                     "s_final = s_mmbert + lambda_expr * s_expr + lambda_style_proto * proto_logit[proto_id]"
                 ),
             }
+        if score_breakdown:
+            eval_debug["candidate_ids_ordered"] = [int(x) for x in candidate_ids]
+            eval_debug["mmbert_score_per_cand"] = mmbert_score.detach().float().cpu().tolist()
+            eval_debug["final_score_per_cand"] = final_score.detach().float().cpu().tolist()
+            if self.uses_full_variant():
+                eval_debug["style_score_per_cand"] = style_score.detach().float().cpu().tolist()
+                eval_debug["expr_score_per_cand"] = expr_score.detach().float().cpu().tolist()
+                eval_debug["graph_score_per_cand"] = graph_score.detach().float().cpu().tolist()
+            else:
+                eval_debug["expr_score_per_cand"] = expr_score.detach().float().cpu().tolist()
+                eval_debug["graph_score_per_cand"] = graph_score.detach().float().cpu().tolist()
         return rank_scores, labels, candidate_ids if use_cands else None, eval_debug
 
 
@@ -1664,13 +1676,19 @@ class StructuredFactorizedPLModel(StructuredPLModel):
             total_steps=int(self.num_training_steps),
         )
 
-    def run_eval_batch(self, batch: Dict[str, Any], return_debug: bool = False):
+    def run_eval_batch(
+        self,
+        batch: Dict[str, Any],
+        return_debug: bool = False,
+        score_breakdown: bool = False,
+    ):
         return self.model.forward_eval_batch(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             img_ids=batch["img_ids"],
             cands=batch.get("cands"),
             return_debug=return_debug,
+            score_breakdown=score_breakdown,
         )
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:

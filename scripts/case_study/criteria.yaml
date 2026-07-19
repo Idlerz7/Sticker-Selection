@@ -1,0 +1,35 @@
+# Case study sample selection (paper experiments) — machine-readable criteria.
+# Human-readable summary: see paper_snippets_zh.txt
+
+version: 1
+
+protocol:
+  task: sticker_retrieval_r10
+  description: >
+    Same validation/test JSON, same candidate list per row, same checkpoint weights.
+    "Baseline" for factorized models is MMBERT-only ranking: base_only=true at eval
+    (see structured_retrieval_factorized.StructuredFactorizedStickerModel._compute_final_score).
+
+primary_pool:
+  name: baseline_wrong_ours_right
+  rules:
+    - baseline_top1_not_equal_gt
+    - full_model_top1_equal_gt
+  optional_excludes:
+    - very_short_dialogue_turns_below: 0  # set to 2+ if you want to drop 1-turn dialogs
+
+secondary_examples:
+  description: >
+    Optional one example each: both_correct, both_wrong, ours_wrong_baseline_right
+    for honesty / limitation discussion (not used in primary_pool).
+
+stratified_sampling:
+  max_cases_per_dialogue_id: 1
+  default_sample_size: 6
+  random_seed: 42
+
+outputs:
+  pool_file: primary_pool.jsonl
+  sampled_file: sampled_cases.json
+  score_breakdown_file: case_score_breakdown.jsonl
+  figure_prefix: case_study

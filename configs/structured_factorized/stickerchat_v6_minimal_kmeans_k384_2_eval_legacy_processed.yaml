@@ -1,0 +1,16 @@
+# Evaluate a kmeans_k384_2-trained checkpoint on legacy stickerchat/processed/ test JSONs
+# (historical candidate splits). Style bank / neighbors / metadata must stay on the K-means
+# assets — only the test file paths switch to ./stickerchat/processed/.
+extends: stickerchat_v6_minimal_kmeans_k384_2.yaml
+
+name: stickerchat_v6_minimal_kmeans_k384_2_eval_legacy_processed
+description: >
+  Same model recipe and K-means (k=384) factorized bank as stickerchat_v6_minimal_kmeans_k384_2,
+  but test / per-epoch paths use stickerchat/processed/ R10+R20 for comparability with MMBERT
+  and other legacy-processed benchmarks.
+
+pl_root_dir: logs/stickerchat_factorized_v6_minimal_kmeans_k384_2_legacy_processed_eval
+
+per_epoch_eval_test_r10_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json
+per_epoch_eval_test_r20_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r20.json
+test_data_path: ./stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json

@@ -1,0 +1,21 @@
+# StickerChat minimal core with K-means style groups (k=384) assets.
+# Same method as stickerchat_v6_minimal_core; only data/bank paths differ.
+extends: stickerchat_v6_minimal_core.yaml
+
+name: stickerchat_v6_minimal_kmeans_k384
+description: >
+  StickerChat v6 minimal core trained on style groups from K-means (k=384) under
+  stickerchat/processed_style_kmeans_k384/.
+
+pl_root_dir: logs/stickerchat_factorized_v6_minimal_kmeans_k384
+
+train_data_path: ./stickerchat/processed_style_kmeans_k384/release_train_u_sticker_format_int.json
+per_epoch_eval_test_r10_path: ./stickerchat/processed_style_kmeans_k384/release_test_u_sticker_format_int_with_cand_r10.json
+per_epoch_eval_test_r20_path: ./stickerchat/processed_style_kmeans_k384/release_test_u_sticker_format_int_with_cand_r20.json
+test_data_path: ./stickerchat/processed_style_kmeans_k384/release_test_u_sticker_format_int_with_cand_r10.json
+
+style_neighbors_path: ./stickerchat/processed_style_kmeans_k384/style_neighbors.json
+factorized_bank_path: ./stickerchat/processed_style_kmeans_k384/factorized_style_bank.json
+factorized_style_metadata_path: ./stickerchat/processed_style_kmeans_k384/sticker_metadata.json
+
+lambda_expr: 0.0
