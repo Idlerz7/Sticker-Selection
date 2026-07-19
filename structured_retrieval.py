@@ -115,6 +115,19 @@ def _with_cand_data_path_if_exists(path: Optional[str]) -> Optional[str]:
     return None
 
 
+def effective_lambda_expr_rank_loss_weight(args: Any) -> float:
+    """Weight for expr *rank* auxiliary loss only.
+
+    If ``lambda_expr_rank_loss`` is None (default), use ``lambda_expr`` — same as legacy behavior.
+    If set (e.g. 0), fused scores still use ``lambda_expr`` in factorized minimal; only the rank
+    auxiliary term changes.
+    """
+    raw = getattr(args, "lambda_expr_rank_loss", None)
+    if raw is None:
+        return float(getattr(args, "lambda_expr", 0.0) or 0.0)
+    return float(raw)
+
+
 def normalize_sticker_id(raw_id: Any) -> StickerId:
     if raw_id is None:
         return ""
@@ -138,6 +151,9 @@ class StructuredArguments(LegacyArguments):
     lambda_fuse: Optional[float] = field(default=3.0)
     lambda_struct: Optional[float] = field(default=0.5)
     lambda_expr: Optional[float] = field(default=0.3)
+    # Optional weight for expr *rank* auxiliary loss only. None = use lambda_expr (backward compatible).
+    # Set to 0.0 to disable expr rank supervision while keeping lambda_expr on fused scores (factorized).
+    lambda_expr_rank_loss: Optional[float] = field(default=None)
     warmup_ratio: Optional[float] = field(default=0.1)
     expr_margin: Optional[float] = field(default=0.1)
     style_neighbor_topk: Optional[int] = field(default=5)
@@ -204,6 +220,8 @@ class StructuredArguments(LegacyArguments):
             raise ValueError("lambda_struct must be >= 0.")
         if self.lambda_expr < 0:
             raise ValueError("lambda_expr must be >= 0.")
+        if self.lambda_expr_rank_loss is not None and float(self.lambda_expr_rank_loss) < 0:
+            raise ValueError("lambda_expr_rank_loss must be >= 0 when set.")
         if self.expr_margin < 0:
             raise ValueError("expr_margin must be >= 0.")
         if not (0.0 <= self.warmup_ratio <= 1.0):
@@ -955,7 +973,7 @@ class StructuredStickerModel(LegacyModel):
             device=device
         )
         structured_aux = self.args.lambda_struct * (style_neighbor_loss + orth_loss)
-        expr_aux = self.args.lambda_expr * expr_rank_loss
+        expr_aux = effective_lambda_expr_rank_loss_weight(self.args) * expr_rank_loss
         if self.args.base_only:
             structured_aux = structured_aux * 0.0
             expr_aux = expr_aux * 0.0
@@ -1367,7 +1385,7 @@ class StructuredPLModel(pl.LightningModule):
         structured_aux = self.args.lambda_struct * (
             outputs.style_neighbor_loss + outputs.orth_loss
         )
-        expr_aux = self.args.lambda_expr * outputs.expr_rank_loss
+        expr_aux = effective_lambda_expr_rank_loss_weight(self.args) * outputs.expr_rank_loss
         if self.args.base_only:
             structured_aux = structured_aux * 0.0
             expr_aux = expr_aux * 0.0

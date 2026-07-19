@@ -35,6 +35,8 @@ expr_gate_mode: sigmoid
 struct_fuse_mode: full
 lambda_struct: 0.5
 lambda_expr: 0.3
+# Optional: weight expr *rank* aux loss only (None = same as lambda_expr). Example: 0 keeps expr in fused score but drops rank aux.
+# lambda_expr_rank_loss: 0
 lambda_style_proto: 0.4
 
 # Factorized step uses query BERT + up to 3× MM-BERT per sample (or 2× if factorized_train_mmbert_two_way).
