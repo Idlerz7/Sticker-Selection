@@ -1,0 +1,12 @@
+# StickerChat minimal core: rank auxiliary on, expr term off in fused score.
+# Same hyperparameters as v6_00_minimal_core_rank_aux_expr_score_off; StickerChat data paths.
+extends: stickerchat_v6_minimal_core.yaml
+name: stickerchat_v6_minimal_rank_aux_expr_score_off
+description: >
+  StickerChat v6 minimal: lambda_expr=0 (no s_expr in s_final); lambda_expr_rank_loss=0.3 for
+  expr rank auxiliary. Prototype prior unchanged.
+
+pl_root_dir: logs/stickerchat_factorized_v6_minimal_rank_aux_expr_score_off
+
+lambda_expr: 0
+lambda_expr_rank_loss: 0.3

@@ -17,5 +17,3 @@ test_data_path: ./stickerchat/processed_style_kmeans_k384/release_test_u_sticker
 style_neighbors_path: ./stickerchat/processed_style_kmeans_k384/style_neighbors.json
 factorized_bank_path: ./stickerchat/processed_style_kmeans_k384/factorized_style_bank.json
 factorized_style_metadata_path: ./stickerchat/processed_style_kmeans_k384/sticker_metadata.json
-
-lambda_expr: 0.0

@@ -1,0 +1,16 @@
+# Opposite of v6_00_minimal_core_expr_fusion_only:
+# - Fused score has NO expr term: s_final = s_mmbert + lambda_style_proto * proto_logit (lambda_expr=0).
+# - Expr *rank* auxiliary loss is ON via explicit lambda_expr_rank_loss (must set if lambda_expr=0).
+extends: v6_00_minimal_core.yaml
+name: v6_00_minimal_core_rank_aux_expr_score_off
+description: >
+  Minimal core with expr rank auxiliary training, but additive scoring does not use s_expr
+  (lambda_expr=0). Expr heads still receive supervision from expr_rank_loss and match_loss.
+
+pl_root_dir: logs/structured_factorized_v6_00_minimal_core_rank_aux_expr_score_off
+
+# Inference / training forward: no expr term in additive fusion
+lambda_expr: 0
+
+# Train: gradient from expr_rank_loss (independent of lambda_expr)
+lambda_expr_rank_loss: 0.3
