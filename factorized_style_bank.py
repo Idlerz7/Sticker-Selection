@@ -453,7 +453,13 @@ class FactorizedStyleBank:
 
     @classmethod
     def from_json(cls, path: str) -> "FactorizedStyleBank":
-        return cls(_read_json(path))
+        value = _read_json(path)
+        if isinstance(value, dict) and value.get("schema_version") == "style_shapes.group_bank.v1":
+            # Local import keeps every legacy caller independent of Style Shapes.
+            from style_shapes.group_bank import GroupBank
+
+            value = GroupBank(value).to_legacy_dict()
+        return cls(value)
 
     def to_dict(self) -> Dict[str, Any]:
         return {

@@ -1,0 +1,14 @@
+dataset: dstc
+id2img: data/id2img.json
+image_root: data/meme_set
+train_pairs: data/train_pair.json
+validation_pairs: data/validation_pair.json
+validation_candidates: data/validation_pair_with_cand.json
+ocr: data/ocr_max10.json
+final_clip_cache: data/meme_set_clip_embs.pt
+checkpoint: logs/clip/lightning_logs/version_6/checkpoints/epoch=7-step=211575.ckpt
+mmbbert_config: configs/mmbbert/v0_01_validation_baseline.yaml
+expected_catalog_size: 307
+expected_train_catalog_size: 285
+expected_candidate_size: 10
+speaker_tokens: 2

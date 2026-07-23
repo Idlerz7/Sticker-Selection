@@ -1,0 +1,23 @@
+seed: 2021
+batch_size: 256
+epochs: 10
+optimizer: adamw
+learning_rate: 0.001
+betas: [0.9, 0.999]
+epsilon: 1.0e-8
+weight_decay: 0.0
+scheduler: cosine
+warmup_steps: 0
+early_stopping: false
+auxiliary_loss: false
+condition_rank: 16
+condition_dim: 256
+unconditional_rank: 21
+variants:
+  - base
+  - unconditional
+  - final_clip
+  - single_vpd
+  - local_lpc
+  - shuffled_lpc
+formal_gate_requires_stickerchat_protocols: [global, same_pack]

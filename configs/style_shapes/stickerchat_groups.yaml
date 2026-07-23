@@ -1,0 +1,19 @@
+dataset: stickerchat
+num_groups: 384
+expected_stickers: 174695
+expected_packs: 3516
+seed: 20260330
+random_seed: 2021
+iterations: 40
+neighbor_topk: 32
+vpd_bundle: artifacts/lvpcm/descriptors/stickerchat/multi_clean.pt
+final_clip_bundle: artifacts/lvpcm/descriptors/stickerchat/final_clip_clean.pt
+metadata: stickerchat/processed/sticker_metadata.json
+reference_metadata: stickerchat/processed_style_kmeans_k384/sticker_metadata.json
+reference_neighbors: stickerchat/processed_style_kmeans_k384/style_neighbors.json
+fixed_validation_r10: stickerchat/processed/release_val_u_sticker_format_int_with_cand_r10.json
+fixed_validation_r20: stickerchat/processed/release_val_u_sticker_format_int_with_cand_r20.json
+fixed_test_r10: stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json
+fixed_test_r20: stickerchat/processed/release_test_u_sticker_format_int_with_cand_r20.json
+output_dir: artifacts/style_shapes/groups/stickerchat
+

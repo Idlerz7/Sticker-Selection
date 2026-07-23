@@ -1,0 +1,15 @@
+seed: 2021
+artifact_root: artifacts/lvpcm
+environment: stickr-select
+clip_model: ckpt/clip-ViT-B-32/0_CLIPModel
+clip_blocks: [3, 6, 9]
+single_block: 6
+pca_components: 256
+pca_svd_solver: randomized
+pca_whiten: false
+lpc_k: 10
+bootstrap_replicates: 10000
+image_batch_size: 256
+neighbor_query_batch_size: 4096
+neighbor_index_batch_size: 16384
+perturbations: [resize75, jpeg75, alpha_bbox]

@@ -1,0 +1,22 @@
+dataset: dstc
+group_source: base_only_reference_sampler
+reference_bank_source: llm_original
+num_groups: 85
+conda_env: stickr-select
+mode: train
+base_config: configs/structured_factorized/v6_00_minimal_core.yaml
+group_bank: artifacts/style_shapes/groups/dstc/llm_original/group_bank.json
+init_checkpoint_path: artifacts/style_shapes/init/dstc_seed2021.ckpt
+permutation_manifest: artifacts/style_shapes/permutations/dstc_seed2021_ws4.json
+output_dir: artifacts/style_shapes/pilot/dstc/base_only_reference_sampler
+model_overrides:
+  gpus: 4
+  base_only: true
+  train_data_path: data/train_pair.json
+  val_data_path: data/validation_pair_with_cand.json
+  test_data_path: data/validation_pair_with_cand.json
+  test_with_cand: true
+  candidate_eval_only: true
+  factorized_train_bank_refresh_steps: 0
+  pl_root_dir: artifacts/style_shapes/pilot/dstc/base_only_reference_sampler/lightning
+
