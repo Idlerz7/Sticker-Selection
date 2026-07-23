@@ -2,6 +2,7 @@ import unittest
 
 from style_shapes.evaluation import metrics_from_ranks, paired_bootstrap, scientific_gate
 from style_shapes.permutations import (
+    ExactDistributedEvalSampler,
     create_permutation_manifest,
     sharded_epoch_indices,
     validate_permutation_manifest,
@@ -23,6 +24,17 @@ class PermutationEvaluationTest(unittest.TestCase):
         value["permutations"][0][0] = value["permutations"][0][1]
         with self.assertRaises(ValueError):
             validate_permutation_manifest(value)
+
+    def test_exact_eval_shards_have_no_padding_or_duplicates(self):
+        dataset = list(range(11))
+        shards = [
+            list(ExactDistributedEvalSampler(dataset, 4, rank))
+            for rank in range(4)
+        ]
+        self.assertEqual([len(row) for row in shards], [3, 3, 3, 2])
+        merged = [item for row in shards for item in row]
+        self.assertEqual(sorted(merged), dataset)
+        self.assertEqual(len(merged), len(set(merged)))
 
     def test_metrics_and_bootstrap(self):
         self.assertEqual(metrics_from_ranks([1, 2, 5])["r@1"], 1 / 3)
@@ -49,4 +61,3 @@ class PermutationEvaluationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

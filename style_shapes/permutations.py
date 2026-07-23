@@ -93,6 +93,28 @@ class FixedEpochDistributedSampler(Sampler):
         return int(math.ceil(len(self.dataset) / float(int(self.manifest["world_size"]))))
 
 
+class ExactDistributedEvalSampler(Sampler):
+    """Rank-strided evaluation shard without padding or duplicated examples."""
+
+    def __init__(self, dataset: Dataset, world_size: int, rank: int):
+        if int(world_size) <= 0:
+            raise ValueError("world_size must be positive")
+        if int(rank) < 0 or int(rank) >= int(world_size):
+            raise ValueError("rank outside evaluation world size")
+        self.dataset = dataset
+        self.world_size = int(world_size)
+        self.rank = int(rank)
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self) -> int:
+        remaining = len(self.dataset) - self.rank
+        if remaining <= 0:
+            return 0
+        return int(math.ceil(remaining / float(self.world_size)))
+
+
 class IndexedDataset(Dataset):
     """Add immutable source-row identity without changing the legacy dataset."""
 
@@ -116,4 +138,3 @@ def process_rank(world_size: int) -> int:
     if rank < 0 or rank >= int(world_size):
         raise RuntimeError("runtime rank %d is incompatible with world size %d" % (rank, world_size))
     return rank
-

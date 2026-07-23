@@ -23,6 +23,7 @@ from structured_retrieval_factorized import StructuredFactorizedPLModel
 
 from .io import atomic_write_json
 from .permutations import (
+    ExactDistributedEvalSampler,
     FixedEpochDistributedSampler,
     IndexedDataset,
     load_permutation_manifest,
@@ -35,14 +36,17 @@ class StyleShapesDataModule(PLDataLoader):
         super().__init__(args, tokenizer)
         self.permutation_path = str(permutation_path)
         self.permutation_manifest = None
+        self._style_shapes_train_dataloader = None
 
     def setup(self, stage: Optional[str] = None):
         super().setup(stage)
         if stage in {"fit", None}:
-            self.train_dataset = IndexedDataset(self.train_dataset)
+            if not isinstance(self.train_dataset, IndexedDataset):
+                self.train_dataset = IndexedDataset(self.train_dataset)
             self.permutation_manifest = load_permutation_manifest(
                 self.permutation_path, len(self.train_dataset)
             )
+            self._style_shapes_train_dataloader = None
 
     def collate_fn(self, batch):
         value = super().collate_fn(batch)
@@ -53,13 +57,15 @@ class StyleShapesDataModule(PLDataLoader):
     def train_dataloader(self):
         if self.permutation_manifest is None:
             raise RuntimeError("StyleShapesDataModule.setup('fit') must run first")
+        if self._style_shapes_train_dataloader is not None:
+            return self._style_shapes_train_dataloader
         world_size = int(self.permutation_manifest["world_size"])
         sampler = FixedEpochDistributedSampler(
             self.train_dataset,
             self.permutation_manifest,
             process_rank(world_size),
         )
-        return DataLoader(
+        self._style_shapes_train_dataloader = DataLoader(
             self.train_dataset,
             batch_size=self.train_batch_size,
             num_workers=self.args.num_workers,
@@ -68,6 +74,38 @@ class StyleShapesDataModule(PLDataLoader):
             shuffle=False,
             collate_fn=self.collate_fn,
         )
+        return self._style_shapes_train_dataloader
+
+    def _style_shapes_eval_dataloader(self, dataset):
+        world_size = int(self.permutation_manifest["world_size"])
+        sampler = None
+        if world_size > 1:
+            sampler = ExactDistributedEvalSampler(
+                dataset,
+                world_size=world_size,
+                rank=process_rank(world_size),
+            )
+        return DataLoader(
+            dataset,
+            batch_size=self.valtest_batch_size,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+            sampler=sampler,
+            shuffle=False,
+            collate_fn=self.collate_fn,
+        )
+
+    def val_dataloader(self):
+        if self.permutation_manifest is None:
+            raise RuntimeError("StyleShapesDataModule.setup('fit') must run first")
+        if getattr(self, "_per_epoch_dual_val_loaders", False):
+            return [
+                self._style_shapes_eval_dataloader(self.val_dataset_r10),
+                self._style_shapes_eval_dataloader(self.val_dataset_r20),
+            ]
+        if self.args.val_data_path:
+            return self._style_shapes_eval_dataloader(self.val_dataset)
+        return None
 
 
 def _sharded_training_steps(num_batches, max_epochs, accumulate_grad_batches=1, limit_train_batches=1.0):
@@ -114,6 +152,7 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
         self._style_shapes_query_scores = []
         self._style_shapes_latency_ms = []
         self._style_shapes_refresh_ms = []
+        self._style_shapes_num_training_steps = None
         super().__init__(args)
         original_factorization = self.model._compute_bank_factorization
 
@@ -138,6 +177,8 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
         trainer = self.trainer
         if trainer.max_steps is not None and trainer.max_steps > 0:
             return int(trainer.max_steps)
+        if self._style_shapes_num_training_steps is not None:
+            return int(self._style_shapes_num_training_steps)
         datamodule = getattr(trainer, "datamodule", None)
         if datamodule is None:
             return super().num_training_steps
@@ -145,12 +186,13 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
             batches = len(datamodule.train_dataloader())
         except Exception:
             return super().num_training_steps
-        return _sharded_training_steps(
+        self._style_shapes_num_training_steps = _sharded_training_steps(
             batches,
             trainer.max_epochs,
             trainer.accumulate_grad_batches,
             trainer.limit_train_batches,
         )
+        return int(self._style_shapes_num_training_steps)
 
     def on_train_start(self):
         result = super().on_train_start()
@@ -324,4 +366,3 @@ def build_final_only_trainer(args, for_train: bool) -> pl.Trainer:
         if unused is not None:
             kwargs["plugins"] = DDPPlugin(find_unused_parameters=unused)
     return pl.Trainer(**kwargs)
-
