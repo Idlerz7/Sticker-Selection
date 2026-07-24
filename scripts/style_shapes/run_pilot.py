@@ -96,6 +96,31 @@ def verify_contract(config, model_args, bank):
         raise RuntimeError("DSTC requires exact bank refresh 0")
     if config["dataset"] == "stickerchat" and int(model_args.factorized_train_bank_refresh_steps) != 500:
         raise RuntimeError("StickerChat requires bank refresh 500")
+    hardware_profile = str(config.get("hardware_profile", "") or "")
+    if hardware_profile:
+        if hardware_profile != "rtx4090_24gb_fp16":
+            raise RuntimeError("unsupported Style Shapes hardware profile")
+        if int(model_args.trainer_precision) != 16:
+            raise RuntimeError("RTX 4090 24GB profile requires trainer_precision=16")
+        if (
+            int(model_args.train_batch_size) != 16
+            or int(model_args.gradient_accumulation_steps) != 1
+        ):
+            raise RuntimeError(
+                "RTX 4090 24GB profile freezes batch=16 and accumulation=1"
+            )
+        if int(model_args.factorized_candidate_forward_chunk_size) != 10:
+            raise RuntimeError("RTX 4090 24GB profile freezes candidate chunk=10")
+        if str(config.get("mode", "train")) == "train":
+            visible_names = [
+                torch.cuda.get_device_name(index)
+                for index in range(torch.cuda.device_count())
+            ]
+            if not visible_names or any("4090" not in name for name in visible_names):
+                raise RuntimeError(
+                    "RTX 4090 24GB profile requires every visible GPU to be a 4090; "
+                    "got %s" % visible_names
+                )
     if config["dataset"] == "stickerchat" and str(config.get("mode", "train")) == "train":
         if str(model_args.factorized_train_mode) == FIXED_SAME_PACK_POLICY:
             expected_r10 = (
@@ -409,6 +434,14 @@ def main():
                 "membership_hash": bank.membership_hash,
                 "world_size": int(model_args.gpus),
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "hardware_profile": str(
+                    config.get("hardware_profile", "default_fp32")
+                ),
+                "trainer_precision": int(model_args.trainer_precision),
+                "train_batch_size_per_device": int(model_args.train_batch_size),
+                "gradient_accumulation_steps": int(
+                    model_args.gradient_accumulation_steps
+                ),
                 "expected_epochs": int(model_args.epochs),
                 "completed_epoch": int(trainer.current_epoch),
                 "expected_optimizer_steps": expected_optimizer_steps,

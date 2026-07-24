@@ -129,6 +129,12 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--force-sequence-length",
+        type=int,
+        default=0,
+        help="Smoke-only right padding used to measure a worst-case dialogue length.",
+    )
     parser.add_argument("--artifact-root", default="artifacts/style_shapes")
     args = parser.parse_args()
 
@@ -145,13 +151,15 @@ def main() -> None:
         manifest_path = output / "smoke_manifest.json"
         init_path = Path(config["init_checkpoint_path"])
         bank = GroupBank.load(config["group_bank"])
+        model_args = _model_args(config, output, args.batch_size)
         expected = {
             "config_sha256": sha256_file(args.config),
             "init_sha256": sha256_file(init_path),
             "membership_hash": bank.membership_hash,
             "batch_size": int(args.batch_size),
+            "trainer_precision": int(model_args.trainer_precision),
+            "forced_sequence_length": int(args.force_sequence_length),
         }
-        model_args = _model_args(config, output, args.batch_size)
         if str(model_args.factorized_variant) != "minimal":
             raise RuntimeError("smoke requires the v6 minimal core")
         negative_sampler = None
@@ -243,6 +251,33 @@ def main() -> None:
             raw_batch = data.collate_fn(
                 [data.train_dataset[index] for index in source_rows]
             )
+        if args.force_sequence_length:
+            target_length = int(args.force_sequence_length)
+            current_length = int(raw_batch["input_ids"].size(1))
+            maximum_length = int(model_args.max_dialogue_length)
+            if target_length < current_length or target_length > maximum_length:
+                raise ValueError(
+                    "forced sequence length must be within [%d,%d], got %d"
+                    % (current_length, maximum_length, target_length)
+                )
+            pad_width = target_length - current_length
+            if pad_width:
+                batch_rows = int(raw_batch["input_ids"].size(0))
+                pad_ids = torch.full(
+                    (batch_rows, pad_width),
+                    int(model.model.bert_tokenizer.pad_token_id),
+                    dtype=raw_batch["input_ids"].dtype,
+                )
+                pad_mask = torch.zeros(
+                    (batch_rows, pad_width),
+                    dtype=raw_batch["attention_mask"].dtype,
+                )
+                raw_batch["input_ids"] = torch.cat(
+                    [raw_batch["input_ids"], pad_ids], dim=1
+                )
+                raw_batch["attention_mask"] = torch.cat(
+                    [raw_batch["attention_mask"], pad_mask], dim=1
+                )
         batch = move_batch_to_device(raw_batch, device)
 
         vectorized_serial_max_abs_diff = None
@@ -307,31 +342,39 @@ def main() -> None:
 
         optimizer, scheduler = _optimizer(model, model_args)
         optimizer.zero_grad()
+        torch.cuda.reset_peak_memory_stats(device)
+        use_amp = int(model_args.trainer_precision) == 16
+        scaler = torch.cuda.amp.GradScaler(
+            enabled=use_amp,
+            init_scale=1024.0,
+        )
+        amp_scale_before = float(scaler.get_scale())
         started = time.perf_counter()
-        if fixed_candidate_runtime is not None:
-            result = model.model.forward_train_listwise_batch(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                img_ids=batch["img_ids"],
-                candidate_ids=batch["train_candidate_ids"],
-                gray_mask=batch["train_candidate_gray_mask"],
-                global_step=0,
-                total_steps=1,
-            )
-        else:
-            result = model.model.forward_train_batch(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                img_ids=batch["img_ids"],
-                neg_img_ids=batch["neg_img_ids"],
-                global_step=0,
-                total_steps=1,
-            )
-        loss = result.loss
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            if fixed_candidate_runtime is not None:
+                result = model.model.forward_train_listwise_batch(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    img_ids=batch["img_ids"],
+                    candidate_ids=batch["train_candidate_ids"],
+                    gray_mask=batch["train_candidate_gray_mask"],
+                    global_step=0,
+                    total_steps=1,
+                )
+            else:
+                result = model.model.forward_train_batch(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    img_ids=batch["img_ids"],
+                    neg_img_ids=batch["neg_img_ids"],
+                    global_step=0,
+                    total_steps=1,
+                )
+            loss = result.loss
         if not bool(torch.isfinite(loss).item()):
             raise RuntimeError("non-finite smoke loss")
         loss_value = float(loss.detach().cpu().item())
-        loss.backward()
+        scaler.scale(loss).backward()
         grad_tensors = [
             value.grad.detach()
             for value in model.parameters()
@@ -340,11 +383,20 @@ def main() -> None:
         grad_nonzero = sum(int(bool(torch.count_nonzero(value).item())) for value in grad_tensors)
         if grad_nonzero <= 0:
             raise RuntimeError("smoke backward produced no non-zero gradients")
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
+        amp_scale_after = float(scaler.get_scale())
+        if use_amp and amp_scale_after < amp_scale_before:
+            raise RuntimeError(
+                "FP16 smoke overflowed and skipped its optimizer step: "
+                "scale %.1f -> %.1f" % (amp_scale_before, amp_scale_after)
+            )
         scheduler.step()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         train_seconds = time.perf_counter() - started
+        train_peak_allocated = int(torch.cuda.max_memory_allocated(device))
+        train_peak_reserved = int(torch.cuda.max_memory_reserved(device))
 
         trace = []
         if fixed_candidate_runtime is not None:
@@ -491,6 +543,12 @@ def main() -> None:
                 "loss": loss_value,
                 "gradient_tensors_nonzero": grad_nonzero,
                 "wall_seconds": train_seconds,
+                "amp_enabled": use_amp,
+                "amp_scale_before": amp_scale_before,
+                "amp_scale_after": amp_scale_after,
+                "input_sequence_length": int(batch["input_ids"].size(1)),
+                "peak_cuda_memory_allocated_bytes": train_peak_allocated,
+                "peak_cuda_memory_reserved_bytes": train_peak_reserved,
                 "vectorized_serial_max_abs_diff_eval_mode": (
                     vectorized_serial_max_abs_diff
                 ),

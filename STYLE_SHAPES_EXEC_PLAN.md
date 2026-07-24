@@ -33,6 +33,7 @@ Last update: 2026-07-24 21:25 UTC
 | Fixed same-pack R10 assets | COMPLETE | 320,168/10,000/10,000 rows; gray counts and hashes frozen |
 | Fixed-listwise VPD/SEMSP engineering | PASS | Batch-16 160-pair forward/backward and strict reload pass on both banks |
 | Fixed-listwise formal training | NOT_STARTED | Run the two independent 10-epoch configs; smoke is not a result |
+| RTX 4090 24GB compatibility | PASS | 490-token worst-case FP16 smoke retains batch 16/chunk 10; 14.56 GiB allocated and 19.35 GiB reserved |
 
 At final resource audit fewer than four equivalent A800s were free. Occupied GPUs were not preempted.
 The formal matrix is RESOURCE_BLOCKED and no historical or smoke metric is substituted.
@@ -65,6 +66,14 @@ empty-mapping packs and their ZIP-member-order fallback rather than hiding the u
 Engineering smoke passed for both group banks with 160 pairs in one vectorized forward,
 nonzero backward gradients, unchanged state-dict keys/parameter count, and strict checkpoint
 reload. No formal metric has been generated.
+
+The isolated RTX 4090 24GB profiles change only Lightning precision from FP32 to native FP16
+and use separate output directories. Query batch 16, candidate chunk 10, accumulation 1,
+candidate order, optimizer, optimizer-step count, and scheduler remain unchanged. A real
+batch-16/160-pair, 490-token AMP forward/backward/optimizer smoke measured
+15,633,250,304 bytes peak allocated and 20,778,582,016 bytes peak reserved, leaving
+approximately 4.6 GiB margin below 24 GiB.
+The original A800 configs contain no hardware profile or precision override and remain FP32.
 
 Every dataset-level variant shares the initialization hash, epoch-permutation hash, batch size,
 candidate order, and hardware conditions. Each rank writes an atomic negative trace containing

@@ -47,6 +47,11 @@ fusion, parameterization, initialization, optimizer, scheduler, batch size, and 
 unchanged. Candidate chunk 10 is the default; 5, 2, then 1 are permitted only after a recorded
 OOM.
 
+RTX 4090 24GB execution uses separate hardware-profile configs with native FP16. These configs
+retain query batch 16, candidate chunk 10, accumulation 1, and the same optimizer-step schedule,
+and write to hardware-specific output directories. Formal training rejects the profile unless
+every visible GPU name contains `4090`. The original A800 configs remain FP32 and unchanged.
+
 All variants of a dataset must strict-load the same weights-only initialization snapshot, use
 the same epoch permutations, fixed candidates, optimizer recipe, and hardware allocation.
 

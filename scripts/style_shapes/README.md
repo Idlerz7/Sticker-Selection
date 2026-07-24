@@ -95,6 +95,21 @@ vectorized 160-pair MM-BERT forward (`candidate_forward_chunk_size=10`). If and 
 reports OOM, explicitly override the config in the registered order 5, 2, 1; lower the query
 batch only after all three fail.
 
+For RTX 4090 24GB servers, use the isolated FP16 profiles below. They preserve batch 16,
+candidate chunk 10, accumulation 1, candidate order, and optimizer-step schedule. The original
+configs remain FP32 and unchanged for A800 runs. The 4090 profiles reject non-4090 visible GPUs
+during formal training and write to separate output directories.
+
+```bash
+CUDA_VISIBLE_DEVICES=<4090-gpus> conda run -n sticker-select python \
+  scripts/style_shapes/run_pilot.py \
+  --config configs/style_shapes/stickerchat_vpd_pack_fixed_same_pack_r10_4090_24g.yaml
+
+CUDA_VISIBLE_DEVICES=<4090-gpus> conda run -n sticker-select python \
+  scripts/style_shapes/run_pilot.py \
+  --config configs/style_shapes/stickerchat_semsp_fixed_same_pack_r10_4090_24g.yaml
+```
+
 After the final checkpoint is written, evaluate all three mandatory protocols on one GPU:
 
 ```bash

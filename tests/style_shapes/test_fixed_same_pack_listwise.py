@@ -116,6 +116,50 @@ class FixedSamePackCandidatesTest(unittest.TestCase):
             10,
         )
 
+    def test_4090_profiles_are_fp16_only_and_leave_a800_configs_unchanged(self):
+        pairs = (
+            (
+                "configs/style_shapes/stickerchat_vpd_pack_fixed_same_pack_r10.yaml",
+                "configs/style_shapes/"
+                "stickerchat_vpd_pack_fixed_same_pack_r10_4090_24g.yaml",
+            ),
+            (
+                "configs/style_shapes/stickerchat_semsp_fixed_same_pack_r10.yaml",
+                "configs/style_shapes/"
+                "stickerchat_semsp_fixed_same_pack_r10_4090_24g.yaml",
+            ),
+        )
+        for a800_path, rtx_path in pairs:
+            with open(a800_path, "r", encoding="utf-8") as handle:
+                a800 = yaml.safe_load(handle)
+            with open(rtx_path, "r", encoding="utf-8") as handle:
+                rtx = yaml.safe_load(handle)
+            self.assertNotIn("hardware_profile", a800)
+            self.assertNotIn("trainer_precision", a800["model_overrides"])
+            self.assertEqual(rtx["hardware_profile"], "rtx4090_24gb_fp16")
+            self.assertEqual(a800["conda_env"], "stickr-select")
+            self.assertEqual(rtx["conda_env"], "sticker-select")
+            self.assertEqual(rtx["model_overrides"]["trainer_precision"], 16)
+            self.assertEqual(rtx["model_overrides"]["train_batch_size"], 16)
+            self.assertEqual(
+                rtx["model_overrides"]["gradient_accumulation_steps"], 1
+            )
+            self.assertEqual(
+                rtx["model_overrides"]["factorized_candidate_forward_chunk_size"],
+                10,
+            )
+            self.assertEqual(a800["group_bank"], rtx["group_bank"])
+            self.assertEqual(
+                a800["fixed_candidates"], rtx["fixed_candidates"]
+            )
+            self.assertEqual(
+                a800["init_checkpoint_path"], rtx["init_checkpoint_path"]
+            )
+            self.assertEqual(
+                a800["permutation_manifest"], rtx["permutation_manifest"]
+            )
+            self.assertNotEqual(a800["output_dir"], rtx["output_dir"])
+
 
 class ListwiseTrainingMathTest(unittest.TestCase):
     def test_minimal_training_step_logs_listwise_debug_at_step_zero(self):
