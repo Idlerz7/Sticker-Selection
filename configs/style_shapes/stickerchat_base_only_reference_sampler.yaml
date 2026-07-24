@@ -13,9 +13,8 @@ model_overrides:
   gpus: 8
   base_only: true
   train_data_path: stickerchat/processed/release_train_u_sticker_format_int.json
-  per_epoch_eval_test_r10_path: stickerchat/processed/release_val_u_sticker_format_int_with_cand_r10.json
+  per_epoch_eval_test_r10_path: stickerchat/processed/release_val_u_sticker_format_int_with_cand_same_pack_r10.json
   per_epoch_eval_test_r20_path: stickerchat/processed/release_val_u_sticker_format_int_with_cand_r20.json
-  test_data_path: stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json
+  test_data_path: stickerchat/processed/release_test_u_sticker_format_int_with_cand_same_pack_r10.json
   factorized_train_bank_refresh_steps: 500
   pl_root_dir: artifacts/style_shapes/pilot/stickerchat/base_only_reference_sampler/lightning
-

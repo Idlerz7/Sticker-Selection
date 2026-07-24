@@ -58,8 +58,11 @@ top 5 for DSTC and top 32 for StickerChat. Original sources import the original 
 
 No formal training may begin until legacy/new membership, sampling, scores, and losses are
 equivalent for DSTC, and the old StickerChat pack-to-K384 membership and legacy/new forward/loss
-are exact. Fixed evaluation candidates are `data/validation_pair_with_cand.json` and the four
-global R10/R20 files under `stickerchat/processed/`.
+are exact. DSTC keeps the legacy `data/validation_pair_with_cand.json`. StickerChat's primary R10
+uses one gold plus nine unique negatives from the original filename-derived pack; only a pack
+shortfall is filled from the global catalog, preserving all 10,000 queries. StickerChat R20 stays
+fully global-random. The previous global R10 remains frozen as a reference protocol. Every group
+source uses the same candidate files and ordering.
 
 Training uses seed 2021, 10 epochs, per-device batch 16, lambdas 0.3/0.4/0.5, AdamW betas
 0.9/0.98, weight decay 0.2, existing two learning rates and cosine schedule, no warmup or early
@@ -70,4 +73,3 @@ Paired query bootstrap uses 10,000 resamples, seed 2021. The preregistered effic
 coverage, and non-inferiority gates are exactly those in `STYLE_SHAPES_EXEC_PLAN.md`. A failed
 engineering gate or scientific gate gives `STOP`. Insufficient free resources gives
 `RESOURCE_BLOCKED`; smoke or historical metrics never substitute for formal results.
-

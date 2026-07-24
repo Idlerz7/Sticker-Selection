@@ -159,7 +159,8 @@ def main():
             "- Deterministic shared-init spherical K-means, legacy K384 reproduction, random controls: PASS.",
             "- DSTC and StickerChat legacy/compact bank-induced forward/loss/sampling equivalence: PASS.",
             "- Nine formal configs parse and enforce minimal core, batch 16, 10 epochs, correct K/refresh/world size: PASS.",
-            "- Fixed DSTC R10 and StickerChat validation/test R10/R20 candidate hashes: PASS.",
+            "- Fixed DSTC legacy R10 and StickerChat same-pack R10/global R20 candidate hashes: PASS; "
+            "the old global R10 remains a frozen reference.",
             "- Unit suite: 15 PASS.",
             "- Real-asset suite: 4 PASS, 1 SKIP (initialization snapshots not generated).",
             "- Weights-only initializer, strict reload check, fixed sampler, atomic rank traces, "
@@ -246,4 +247,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

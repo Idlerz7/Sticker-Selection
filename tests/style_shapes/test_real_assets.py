@@ -99,6 +99,14 @@ class RealAssetIntegrationTest(unittest.TestCase):
                 20,
                 "11a1952f6db7bb58d0fb817585a9ef04c759e9c86d26244c8033fc58f7ad5356",
             ),
+            "stickerchat/processed/release_val_u_sticker_format_int_with_cand_same_pack_r10.json": (
+                10,
+                "4f15007736239b1bc474b49668ef016fd26007f93357a06dc985ad5b7c79a4be",
+            ),
+            "stickerchat/processed/release_test_u_sticker_format_int_with_cand_same_pack_r10.json": (
+                10,
+                "1e1711244ccde8652144fea3a79b3c769cdbae0ef74b0dd255e332cf223b7fa5",
+            ),
         }
         for path, (size, digest) in expected.items():
             self.assertEqual(sha256_file(path), digest)
@@ -116,4 +124,3 @@ class RealAssetIntegrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

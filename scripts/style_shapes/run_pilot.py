@@ -87,6 +87,18 @@ def verify_contract(config, model_args, bank):
         raise RuntimeError("DSTC requires exact bank refresh 0")
     if config["dataset"] == "stickerchat" and int(model_args.factorized_train_bank_refresh_steps) != 500:
         raise RuntimeError("StickerChat requires bank refresh 500")
+    if config["dataset"] == "stickerchat" and str(config.get("mode", "train")) == "train":
+        expected_r10 = (
+            "stickerchat/processed/"
+            "release_val_u_sticker_format_int_with_cand_same_pack_r10.json"
+        )
+        expected_r20 = (
+            "stickerchat/processed/release_val_u_sticker_format_int_with_cand_r20.json"
+        )
+        if str(model_args.per_epoch_eval_test_r10_path) != expected_r10:
+            raise RuntimeError("StickerChat training requires fixed same-pack R10 validation")
+        if str(model_args.per_epoch_eval_test_r20_path) != expected_r20:
+            raise RuntimeError("StickerChat training requires fixed global-random R20 validation")
 
 
 def save_checkpoint_atomic(trainer, path):

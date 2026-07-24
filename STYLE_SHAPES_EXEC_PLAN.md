@@ -13,14 +13,17 @@ Last update: 2026-07-23 16:10 UTC
 - DSTC reference bank: `factorized_style_bank.json`.
 - StickerChat reference bank:
   `stickerchat/processed_style_kmeans_k384/factorized_style_bank.json`.
-- Fixed evaluation candidates are the original `data/` and `stickerchat/processed/` files,
-  never group-rebuilt evaluation files.
+- DSTC fixed evaluation candidates remain the original SEMSP
+  `data/validation_pair_with_cand.json`. StickerChat primary R10 is pack-derived with global
+  fallback only when a pack has fewer than nine alternatives; R20 remains fully global-random,
+  and the old global R10 remains a reference. Candidates are frozen once and never depend on
+  the compared K384 grouping.
 
 ## Stage ledger
 
 | Stage | State | Gate / next action |
 |---|---|---|
-| Repository and asset audit | COMPLETE | Hashes and all five fixed candidate files validated |
+| Repository and asset audit | COMPLETE | Legacy DSTC, StickerChat same-pack R10/global R20, and reference global R10 hashes validated |
 | Group Bank v1 and builders | COMPLETE | Seven compact banks built and content-hashed |
 | Legacy equivalence | PASS | Partition, sampling, prototype score and loss are elementwise equal |
 | Weights-only init / order / trace | EXECUTION_BLOCKED | Order/trace code and manifests complete; snapshot GPU command approval failed |
@@ -55,5 +58,5 @@ must cover every expected epoch/source row exactly once.
   least half reference; same-group-negative coverage at least 75% and no more than 5 percentage
   points below reference.
 
-No K scan, loss change, candidate change, early stopping, or per-variant tuning is permitted.
-
+After the preregistered candidate-protocol correction above, no K scan, loss change, further
+candidate change, early stopping, or per-variant tuning is permitted.

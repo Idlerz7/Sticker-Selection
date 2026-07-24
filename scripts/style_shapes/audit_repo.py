@@ -18,6 +18,10 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from style_shapes.builders import load_descriptor
+from style_shapes.candidates import (
+    audit_same_pack_candidates,
+    id_to_pack_from_id2img,
+)
 from style_shapes.io import (
     atomic_write_json,
     atomic_write_text,
@@ -42,23 +46,47 @@ def main():
                 if ids != list(range(count)) or list(features.shape) != [count, dim]:
                     raise RuntimeError("%s %s descriptor contract failed" % (dataset, family))
                 descriptors[dataset][family] = meta
+        same_pack_validation = (
+            "stickerchat/processed/"
+            "release_val_u_sticker_format_int_with_cand_same_pack_r10.json"
+        )
+        same_pack_test = (
+            "stickerchat/processed/"
+            "release_test_u_sticker_format_int_with_cand_same_pack_r10.json"
+        )
+        with open("stickerchat/processed/id2img.json", "r", encoding="utf-8") as handle:
+            id_to_pack = id_to_pack_from_id2img(json.load(handle))
+        with open(same_pack_validation, "r", encoding="utf-8") as handle:
+            validation_composition = audit_same_pack_candidates(
+                json.load(handle), id_to_pack, 10
+            )
+        with open(same_pack_test, "r", encoding="utf-8") as handle:
+            test_composition = audit_same_pack_candidates(json.load(handle), id_to_pack, 10)
         candidates = {
             "dstc_validation_r10": candidate_file_audit(
                 "data/validation_pair_with_cand.json", 10
             ),
-            "stickerchat_validation_r10": candidate_file_audit(
+            "stickerchat_validation_same_pack_r10": {
+                **candidate_file_audit(same_pack_validation, 10),
+                "composition": validation_composition,
+            },
+            "stickerchat_validation_global_r10_reference": candidate_file_audit(
                 "stickerchat/processed/release_val_u_sticker_format_int_with_cand_r10.json",
                 10,
             ),
-            "stickerchat_validation_r20": candidate_file_audit(
+            "stickerchat_validation_global_r20": candidate_file_audit(
                 "stickerchat/processed/release_val_u_sticker_format_int_with_cand_r20.json",
                 20,
             ),
-            "stickerchat_test_r10": candidate_file_audit(
+            "stickerchat_test_same_pack_r10": {
+                **candidate_file_audit(same_pack_test, 10),
+                "composition": test_composition,
+            },
+            "stickerchat_test_global_r10_reference": candidate_file_audit(
                 "stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json",
                 10,
             ),
-            "stickerchat_test_r20": candidate_file_audit(
+            "stickerchat_test_global_r20": candidate_file_audit(
                 "stickerchat/processed/release_test_u_sticker_format_int_with_cand_r20.json",
                 20,
             ),
@@ -117,7 +145,8 @@ def main():
             % (torch.__version__, torch.version.cuda, torch.cuda.device_count()),
             "- VPD bundles: DSTC `[307,256]`; StickerChat `[174695,256]`, finite and ID-aligned.",
             "- Final-CLIP bundles: DSTC `[307,512]`; StickerChat `[174695,512]`, finite and ID-aligned.",
-            "- Fixed candidates validated: DSTC validation R10; StickerChat validation/test R10/R20.",
+            "- Fixed candidates validated: DSTC legacy R10; StickerChat same-pack-with-global-"
+            "fallback R10 and global R20. The old global R10 remains frozen as a reference.",
             "- Free filesystem space: %.1f GiB." % (disk.free / 2**30),
             "- Formal training remains resource-gated; occupied GPUs will not be preempted.",
             "",
@@ -129,4 +158,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

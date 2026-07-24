@@ -17,7 +17,7 @@ from style_shapes.io import atomic_write_json, atomic_write_text, command_record
 
 REQUIRED = {
     "dstc": {"fixed_validation_r10"},
-    "stickerchat": {"global_test_r10", "global_test_r20"},
+    "stickerchat": {"same_pack_test_r10", "global_test_r20"},
 }
 
 
@@ -67,4 +67,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
