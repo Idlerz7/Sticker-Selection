@@ -31,6 +31,9 @@ from style_shapes.contracts import (
 )
 from style_shapes.group_bank import GroupBank
 from style_shapes.io import atomic_write_json, command_record, sha256_file
+from style_shapes.negative_sampling import (
+    load_dual_local_runtime,
+)
 from style_shapes.runtime import resolve_permutation_world_size
 from style_shapes.training import StyleShapesDataModule, StyleShapesPLModel
 
@@ -101,6 +104,23 @@ def main() -> None:
         )
         model_args = _build_args(config, output, world_size)
         bank = GroupBank.load(config["group_bank"])
+        negative_sampler = None
+        eligibility_manifest = None
+        eligible_source_rows = None
+        if config.get("negative_sampling") is not None:
+            negative_sampler, eligibility_manifest = load_dual_local_runtime(
+                config["negative_sampling"],
+                train_data_path=model_args.train_data_path,
+                group_bank_path=config["group_bank"],
+                bank=bank,
+            )
+            eligible_source_rows = [
+                int(value) for value in eligibility_manifest["eligible_rows"]
+            ]
+            if int(permutation["num_rows"]) != len(eligible_source_rows):
+                raise RuntimeError(
+                    "preflight permutation rows do not match dual-local eligibility"
+                )
         init_path = config["init_checkpoint_path"]
         pl.seed_everything(int(model_args.seed))
 
@@ -108,10 +128,14 @@ def main() -> None:
             model_args,
             membership_hash=bank.membership_hash,
             trace_dir=str(output / "negative_trace"),
+            negative_sampler=negative_sampler,
         )
         load_checkpoint_to_model(model, init_path, strict=True)
         datamodule = StyleShapesDataModule(
-            model_args, model.model.bert_tokenizer, permutation_path
+            model_args,
+            model.model.bert_tokenizer,
+            permutation_path,
+            eligible_source_rows=eligible_source_rows,
         )
 
         callbacks = []
@@ -207,6 +231,16 @@ def main() -> None:
             },
             "wall_seconds": wall_seconds,
         }
+        if eligibility_manifest is not None:
+            result.update(
+                {
+                    "negative_policy": negative_sampler.policy,
+                    "eligible_training_rows": len(eligible_source_rows),
+                    "eligibility_manifest_hash": eligibility_manifest[
+                        "manifest_hash"
+                    ],
+                }
+            )
         atomic_write_json(manifest_path, result)
         print(json.dumps(result, ensure_ascii=False, indent=2))
 

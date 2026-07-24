@@ -34,6 +34,11 @@ from style_shapes.contracts import (
 )
 from style_shapes.group_bank import GroupBank
 from style_shapes.io import atomic_write_json, command_record, sha256_file
+from style_shapes.negative_sampling import (
+    DUAL_LOCAL_GROUP_SOURCE_BY_POLICY,
+    DUAL_LOCAL_POLICIES,
+    load_dual_local_runtime,
+)
 from style_shapes.permutations import load_permutation_manifest
 from style_shapes.runtime import resolve_permutation_world_size
 from style_shapes.training import (
@@ -99,6 +104,26 @@ def verify_contract(config, model_args, bank):
             raise RuntimeError("StickerChat training requires fixed same-pack R10 validation")
         if str(model_args.per_epoch_eval_test_r20_path) != expected_r20:
             raise RuntimeError("StickerChat training requires fixed global-random R20 validation")
+    negative_config = config.get("negative_sampling")
+    if negative_config is not None:
+        negative_policy = str(negative_config.get("mode", ""))
+        if negative_policy not in DUAL_LOCAL_POLICIES:
+            raise RuntimeError("unsupported special negative-sampling policy")
+        expected_group_source = DUAL_LOCAL_GROUP_SOURCE_BY_POLICY[negative_policy]
+        if (
+            config["dataset"] != "stickerchat"
+            or config["group_source"] != expected_group_source
+        ):
+            raise RuntimeError(
+                "dual-local policy %s requires StickerChat group source %s"
+                % (negative_policy, expected_group_source)
+            )
+        if int(getattr(model_args, "train_same_proto_negatives", 0)) != 1:
+            raise RuntimeError("dual-local negatives require one same-slot negative")
+        if int(getattr(model_args, "train_cross_proto_negatives", 0)) != 1:
+            raise RuntimeError("dual-local negatives require one cross-slot negative")
+        if bool(getattr(model_args, "factorized_train_mmbert_two_way", False)):
+            raise RuntimeError("dual-local negatives require the three-candidate match loss")
 
 
 def save_checkpoint_atomic(trainer, path):
@@ -138,6 +163,7 @@ def main():
         if args.run_output_dir is not None:
             config["output_dir"] = args.run_output_dir
         mode = str(config.get("mode", "train"))
+        runtime_permutation = None
         if mode == "test":
             config["model_overrides"]["mode"] = "test"
             config["model_overrides"]["gpus"] = 1
@@ -151,7 +177,7 @@ def main():
             if runtime_gpus <= 0:
                 raise RuntimeError("formal training requires at least one visible CUDA GPU")
             config["model_overrides"]["gpus"] = runtime_gpus
-            runtime_path, _ = resolve_permutation_world_size(
+            runtime_path, runtime_permutation = resolve_permutation_world_size(
                 config["permutation_manifest"], runtime_gpus
             )
             config["permutation_manifest"] = runtime_path
@@ -162,6 +188,26 @@ def main():
             raise RuntimeError("Group Bank public adapter failed")
         model_args = build_model_args(config)
         verify_contract(config, model_args, bank)
+        negative_sampler = None
+        eligibility_manifest = None
+        eligible_source_rows = None
+        if config.get("negative_sampling") is not None:
+            negative_sampler, eligibility_manifest = load_dual_local_runtime(
+                config["negative_sampling"],
+                train_data_path=model_args.train_data_path,
+                group_bank_path=config["group_bank"],
+                bank=bank,
+            )
+            eligible_source_rows = [
+                int(value) for value in eligibility_manifest["eligible_rows"]
+            ]
+            if (
+                mode == "train"
+                and int(runtime_permutation["num_rows"]) != len(eligible_source_rows)
+            ):
+                raise RuntimeError(
+                    "dual-local permutation rows do not match eligible training rows"
+                )
         pl.seed_everything(int(model_args.seed))
         output = Path(config["output_dir"])
         mode = str(config.get("mode", "train"))
@@ -187,12 +233,24 @@ def main():
                     and existing.get("permutation_manifest", {}).get("sha256")
                     == sha256_file(config["permutation_manifest"])
                 )
+                if compatible and eligibility_manifest is not None:
+                    compatible = (
+                        existing.get("negative_policy")
+                        == eligibility_manifest["negative_policy"]
+                        and existing.get("eligibility_manifest", {}).get("manifest_hash")
+                        == eligibility_manifest["manifest_hash"]
+                    )
             if mode == "test" and compatible:
                 compatible = (
                     checkpoint_path and Path(checkpoint_path).exists()
                     and existing.get("checkpoint", {}).get("sha256") == sha256_file(checkpoint_path)
                     and existing.get("test_data_path") == model_args.test_data_path
                 )
+                if compatible and config.get("negative_sampling") is not None:
+                    compatible = (
+                        existing.get("negative_policy")
+                        == str(config["negative_sampling"]["mode"])
+                    )
             if not compatible:
                 raise RuntimeError(
                     "refusing legacy, interrupted, or incompatible completed pilot "
@@ -209,6 +267,7 @@ def main():
             membership_hash=bank.membership_hash,
             trace_dir=str(output / "negative_trace") if mode == "train" else "",
             per_query_dir=per_query_dir,
+            negative_sampler=negative_sampler,
         )
         if mode == "train":
             if not init_path:
@@ -221,7 +280,10 @@ def main():
             if int(permutation["world_size"]) != expected_world:
                 raise RuntimeError("permutation world size does not match visible CUDA devices")
             datamodule = StyleShapesDataModule(
-                model_args, model.model.bert_tokenizer, config["permutation_manifest"]
+                model_args,
+                model.model.bert_tokenizer,
+                config["permutation_manifest"],
+                eligible_source_rows=eligible_source_rows,
             )
             trainer = build_final_only_trainer(model_args, for_train=True)
             attach_version_log_from_trainer(model_args, trainer)
@@ -287,6 +349,20 @@ def main():
                 "training_wall_seconds": training_wall_seconds,
                 "training_performance_dir": str(output / "negative_trace"),
             }
+            if eligibility_manifest is not None:
+                result.update(
+                    {
+                        "negative_policy": eligibility_manifest["negative_policy"],
+                        "eligible_training_rows": len(eligible_source_rows),
+                        "eligibility_manifest": {
+                            "path": config["negative_sampling"]["eligibility_manifest"],
+                            "sha256": sha256_file(
+                                config["negative_sampling"]["eligibility_manifest"]
+                            ),
+                            "manifest_hash": eligibility_manifest["manifest_hash"],
+                        },
+                    }
+                )
         elif mode == "test":
             if int(model_args.gpus) != 1:
                 raise RuntimeError("formal final evaluation must run on one GPU")
@@ -312,6 +388,10 @@ def main():
                 "test_data_path": model_args.test_data_path,
                 "evaluation_wall_seconds": evaluation_wall_seconds,
             }
+            if config.get("negative_sampling") is not None:
+                result["negative_policy"] = str(
+                    config["negative_sampling"]["mode"]
+                )
         else:
             raise ValueError("mode must be train or test")
         atomic_write_json(output / ("%s_manifest.json" % mode), result)

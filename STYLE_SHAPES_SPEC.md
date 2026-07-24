@@ -18,6 +18,13 @@ sources are:
   sampling and therefore measures the complete group-induced training structure, not a pure
   no-group intervention.
 
+Two isolated optional StickerChat dual-local variants replace prototype-aware cross/same
+sampling with one raw same-pack negative plus one distinct random group Final-CLIP top-32
+neighbor. `vpd_pack_dual_local_negatives` uses the VPD membership;
+`semsp_dual_local_negatives` uses the original SEMSP
+`final_clip_pack_original` membership. Both filter singleton raw-pack positives and have no
+fallback.
+
 All variants of a dataset must strict-load the same weights-only initialization snapshot, use
 the same epoch permutations, fixed candidates, optimizer recipe, and hardware allocation.
 

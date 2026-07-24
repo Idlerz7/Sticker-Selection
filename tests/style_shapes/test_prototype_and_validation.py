@@ -55,7 +55,39 @@ class PrototypeValidationTest(unittest.TestCase):
             self.assertTrue(result["complete_coverage"])
             self.assertEqual(result["known_ddp_padding_records"], 0)
 
+    def test_trace_complete_coverage_for_filtered_source_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rank0.jsonl"
+            records = []
+            for epoch in range(2):
+                for source_row in (1, 3):
+                    records.append(
+                        {
+                            "epoch": epoch,
+                            "global_step": epoch,
+                            "rank": 0,
+                            "source_row": source_row,
+                            "positive": source_row,
+                            "fallback": 0,
+                            "cross": 2,
+                            "same": 4,
+                            "membership_hash": "abc",
+                        }
+                    )
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in records),
+                encoding="utf-8",
+            )
+            result = merge_and_validate_traces(
+                [str(path)],
+                2,
+                2,
+                "abc",
+                expected_source_rows=[1, 3],
+            )
+            self.assertEqual(result["expected_source_row_count"], 2)
+            self.assertTrue(result["complete_coverage"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -29,6 +29,10 @@ from structured_retrieval_factorized import parse_structured_factorized_args
 from structured_retrieval_tokens import _config_mapping_to_argv
 from style_shapes.group_bank import GroupBank
 from style_shapes.io import atomic_write_json, command_record, sha256_file
+from style_shapes.negative_sampling import (
+    load_dual_local_runtime,
+    validate_dual_local_trace_record,
+)
 from style_shapes.training import StyleShapesDataModule, StyleShapesPLModel
 
 
@@ -137,6 +141,28 @@ def main() -> None:
             "membership_hash": bank.membership_hash,
             "batch_size": int(args.batch_size),
         }
+        model_args = _model_args(config, output, args.batch_size)
+        if str(model_args.factorized_variant) != "minimal":
+            raise RuntimeError("smoke requires the v6 minimal core")
+        negative_sampler = None
+        eligibility_manifest = None
+        eligible_source_rows = None
+        if config.get("negative_sampling") is not None:
+            negative_sampler, eligibility_manifest = load_dual_local_runtime(
+                config["negative_sampling"],
+                train_data_path=model_args.train_data_path,
+                group_bank_path=config["group_bank"],
+                bank=bank,
+            )
+            eligible_source_rows = [
+                int(value) for value in eligibility_manifest["eligible_rows"]
+            ]
+            expected.update(
+                {
+                    "negative_policy": negative_sampler.policy,
+                    "eligibility_manifest_hash": eligibility_manifest["manifest_hash"],
+                }
+            )
         if manifest_path.exists():
             with manifest_path.open("r", encoding="utf-8") as handle:
                 existing = json.load(handle)
@@ -149,16 +175,13 @@ def main() -> None:
         if output.exists() and any(output.iterdir()):
             raise RuntimeError("refusing non-empty incomplete smoke output: %s" % output)
         output.mkdir(parents=True, exist_ok=True)
-
-        model_args = _model_args(config, output, args.batch_size)
-        if str(model_args.factorized_variant) != "minimal":
-            raise RuntimeError("smoke requires the v6 minimal core")
         pl.seed_everything(2021)
         device = torch.device("cuda:0")
 
         model = StyleShapesPLModel(
             model_args,
             membership_hash=bank.membership_hash,
+            negative_sampler=negative_sampler,
         )
         load_checkpoint_to_model(model, str(init_path), strict=True)
         model.to(device)
@@ -171,6 +194,7 @@ def main() -> None:
             model_args,
             model.model.bert_tokenizer,
             config["permutation_manifest"],
+            eligible_source_rows=eligible_source_rows,
         )
         data.setup("fit")
         batch = move_batch_to_device(next(iter(data.train_dataloader())), device)
@@ -216,16 +240,26 @@ def main() -> None:
             cross,
             same,
         ):
-            trace.append(
-                {
-                    "source_row": int(source_row),
-                    "positive": int(positive),
-                    "fallback": int(fallback),
-                    "cross": int(cross_id),
-                    "same": int(same_id),
-                    "membership_hash": bank.membership_hash,
-                }
-            )
+            record = {
+                "source_row": int(source_row),
+                "positive": int(positive),
+                "fallback": int(fallback),
+                "cross": int(cross_id),
+                "same": int(same_id),
+                "membership_hash": bank.membership_hash,
+            }
+            if negative_sampler is not None:
+                record.update(
+                    {
+                        "negative_policy": negative_sampler.policy,
+                        "group_top32": int(cross_id),
+                        "same_pack": int(same_id),
+                        "fallback_used": False,
+                    }
+                )
+                record[negative_sampler.neighbor_trace_field] = int(cross_id)
+                validate_dual_local_trace_record(record, negative_sampler)
+            trace.append(record)
         atomic_write_json(output / "negative_trace.json", trace)
 
         checkpoint_path = output / "one_step.ckpt"
@@ -281,6 +315,11 @@ def main() -> None:
             "formal_result": False,
             "dataset": config["dataset"],
             "group_source": config["group_source"],
+            "negative_policy": (
+                negative_sampler.policy
+                if negative_sampler is not None
+                else "prototype_cross_plus_same"
+            ),
             **expected,
             "checkpoint": {
                 "path": str(checkpoint_path),

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from .io import hash_value, sha256_file
 
@@ -40,10 +40,12 @@ def candidate_file_audit(path: str, expected_candidates: int) -> dict:
 
 def merge_and_validate_traces(
     paths: Sequence[str],
-    num_rows: int,
+    num_rows: Optional[int],
     epochs: int,
     membership_hash: str,
     output_path: str = "",
+    expected_source_rows: Optional[Sequence[int]] = None,
+    record_validator: Optional[Callable[[Mapping], None]] = None,
 ) -> dict:
     records = []
     for path in paths:
@@ -59,10 +61,32 @@ def merge_and_validate_traces(
         counts[key] += 1
         for name in ("positive", "fallback", "cross", "same"):
             int(record[name])
+        if record_validator is not None:
+            record_validator(record)
+    if expected_source_rows is None:
+        if num_rows is None:
+            raise ValueError("num_rows or expected_source_rows is required")
+        expected_rows = list(range(int(num_rows)))
+    else:
+        expected_rows = [int(value) for value in expected_source_rows]
+        if len(set(expected_rows)) != len(expected_rows):
+            raise ValueError("expected source rows are not unique")
+        if num_rows is not None and int(num_rows) != len(expected_rows):
+            raise ValueError("num_rows does not match expected source rows")
+    expected_set = set(expected_rows)
+    unexpected = sorted(
+        {
+            int(record["source_row"])
+            for record in records
+            if int(record["source_row"]) not in expected_set
+        }
+    )
+    if unexpected:
+        raise ValueError("negative trace contains %d unexpected source rows" % len(unexpected))
     missing = [
         [epoch, source_row]
         for epoch in range(int(epochs))
-        for source_row in range(int(num_rows))
+        for source_row in expected_rows
         if counts[(epoch, source_row)] == 0
     ]
     if missing:
@@ -74,7 +98,9 @@ def merge_and_validate_traces(
             {"path": str(path), "sha256": sha256_file(path)} for path in paths
         ],
         "records": len(records),
-        "expected_unique_records": int(num_rows) * int(epochs),
+        "expected_unique_records": len(expected_rows) * int(epochs),
+        "expected_source_row_count": len(expected_rows),
+        "expected_source_rows_hash": hash_value(expected_rows),
         "known_ddp_padding_records": duplicates,
         "complete_coverage": True,
         "membership_hash": membership_hash,
@@ -98,4 +124,3 @@ def artifact_records(paths: Iterable[str]) -> list:
             }
         )
     return output
-

@@ -41,6 +41,13 @@ The formal matrix is RESOURCE_BLOCKED and no historical or smoke metric is subst
 - StickerChat: `final_clip_pack_original`, `vpd_pack`, `random_pack_matched`,
   `base_only_reference_sampler`; world size 8.
 
+The isolated `stickerchat_vpd_pack_dual_local_negatives` and
+`stickerchat_semsp_dual_local_negatives` special runs use the same initialization,
+optimization recipe, evaluation candidates, 319,876 eligible rows, and 292 singleton-pack
+exclusions. They differ only in the group bank used for the second top-32 negative: VPD
+membership versus original SEMSP `final_clip_pack_original` membership. Neither is part of
+the preregistered group-source comparison matrix.
+
 Every dataset-level variant shares the initialization hash, epoch-permutation hash, batch size,
 candidate order, and hardware conditions. Each rank writes an atomic negative trace containing
 `source_row`, positive, fallback, cross, same, epoch, rank, and membership hash. Merged traces

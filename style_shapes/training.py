@@ -9,7 +9,7 @@ import time
 
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import pytorch_lightning as pl
 import torch
@@ -26,22 +26,39 @@ from .permutations import (
     ExactDistributedEvalSampler,
     FixedEpochDistributedSampler,
     IndexedDataset,
+    IndexedSubsetDataset,
     load_permutation_manifest,
     process_rank,
 )
 
 
 class StyleShapesDataModule(PLDataLoader):
-    def __init__(self, args, tokenizer, permutation_path: str):
+    def __init__(
+        self,
+        args,
+        tokenizer,
+        permutation_path: str,
+        eligible_source_rows: Optional[Sequence[int]] = None,
+    ):
         super().__init__(args, tokenizer)
         self.permutation_path = str(permutation_path)
+        self.eligible_source_rows = (
+            None
+            if eligible_source_rows is None
+            else [int(value) for value in eligible_source_rows]
+        )
         self.permutation_manifest = None
         self._style_shapes_train_dataloader = None
 
     def setup(self, stage: Optional[str] = None):
         super().setup(stage)
         if stage in {"fit", None}:
-            if not isinstance(self.train_dataset, IndexedDataset):
+            if self.eligible_source_rows is not None:
+                if not isinstance(self.train_dataset, IndexedSubsetDataset):
+                    self.train_dataset = IndexedSubsetDataset(
+                        self.train_dataset, self.eligible_source_rows
+                    )
+            elif not isinstance(self.train_dataset, IndexedDataset):
                 self.train_dataset = IndexedDataset(self.train_dataset)
             self.permutation_manifest = load_permutation_manifest(
                 self.permutation_path, len(self.train_dataset)
@@ -127,6 +144,7 @@ def _install_negative_trace_hook(owner, factorized_model):
     def traced(*args, **kwargs):
         value = original(*args, **kwargs)
         owner._style_shapes_last_negatives = (list(value[0]), list(value[1]))
+        owner._style_shapes_last_negative_meta = dict(value[2])
         return value
 
     factorized_model._resolve_prototype_aware_negatives = traced
@@ -141,11 +159,19 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
         membership_hash: str,
         trace_dir: str = "",
         per_query_dir: str = "",
+        negative_sampler: Any = None,
     ):
         self.style_shapes_membership_hash = str(membership_hash)
         self.style_shapes_trace_dir = str(trace_dir or "")
         self.style_shapes_per_query_dir = str(per_query_dir or "")
+        self.style_shapes_negative_policy = (
+            str(getattr(negative_sampler, "policy", "prototype_cross_plus_same"))
+        )
+        self.style_shapes_neighbor_trace_field = str(
+            getattr(negative_sampler, "neighbor_trace_field", "")
+        )
         self._style_shapes_last_negatives = None
+        self._style_shapes_last_negative_meta = None
         self._style_shapes_trace_handle = None
         self._style_shapes_trace_partial = None
         self._style_shapes_trace_final = None
@@ -169,6 +195,8 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
             return value
 
         self.model._compute_bank_factorization = timed_factorization
+        if negative_sampler is not None:
+            negative_sampler.install(self.model)
         _install_negative_trace_hook(self, self.model)
 
 
@@ -236,6 +264,17 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
                     "same": int(same_id),
                     "membership_hash": self.style_shapes_membership_hash,
                 }
+                if self.style_shapes_negative_policy != "prototype_cross_plus_same":
+                    record.update(
+                        {
+                            "negative_policy": self.style_shapes_negative_policy,
+                            "group_top32": int(cross_id),
+                            "same_pack": int(same_id),
+                            "fallback_used": False,
+                        }
+                    )
+                    if self.style_shapes_neighbor_trace_field:
+                        record[self.style_shapes_neighbor_trace_field] = int(cross_id)
                 self._style_shapes_trace_handle.write(
                     json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
                 )
@@ -262,6 +301,7 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
                 Path(self.style_shapes_trace_dir) / ("rank_%02d_performance.json" % int(getattr(self, "global_rank", 0))),
                 {
                     "membership_hash": self.style_shapes_membership_hash,
+                    "negative_policy": self.style_shapes_negative_policy,
                     "refresh_cost_sample_count": len(values),
                     "refresh_cost_mean_ms": sum(values) / len(values) if values else None,
                     "refresh_cost_p95_ms": p95,

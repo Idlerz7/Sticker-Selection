@@ -130,6 +130,31 @@ class IndexedDataset(Dataset):
         return value
 
 
+class IndexedSubsetDataset(Dataset):
+    """Expose a frozen source-row subset while retaining original row identity."""
+
+    def __init__(self, dataset: Dataset, source_rows: List[int]):
+        self.dataset = dataset
+        self.source_rows = [int(value) for value in source_rows]
+        if self.source_rows != sorted(self.source_rows):
+            raise ValueError("subset source rows must be sorted")
+        if len(set(self.source_rows)) != len(self.source_rows):
+            raise ValueError("subset source rows must be unique")
+        if self.source_rows and (
+            self.source_rows[0] < 0 or self.source_rows[-1] >= len(dataset)
+        ):
+            raise ValueError("subset source row is outside the dataset")
+
+    def __len__(self) -> int:
+        return len(self.source_rows)
+
+    def __getitem__(self, index):
+        source_row = self.source_rows[int(index)]
+        value = dict(self.dataset[source_row])
+        value["_style_shapes_source_row"] = source_row
+        return value
+
+
 def process_rank(world_size: int) -> int:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         rank = int(torch.distributed.get_rank())

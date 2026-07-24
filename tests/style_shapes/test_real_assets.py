@@ -15,6 +15,12 @@ from style_shapes.builders import (
 from style_shapes.clustering import legacy_pack_kmeans
 from style_shapes.group_bank import GroupBank
 from style_shapes.io import sha256_file
+from style_shapes.negative_sampling import (
+    StickerChatDualLocalNegativeSampler,
+    build_eligibility_manifest,
+    load_id_to_pack,
+    validate_eligibility_manifest,
+)
 from style_shapes.validation import candidate_file_audit
 
 
@@ -120,6 +126,36 @@ class RealAssetIntegrationTest(unittest.TestCase):
         missing = [path for path in paths if not os.path.exists(path)]
         if missing:
             self.skipTest("GPU initialization execution approval blocked: %s" % missing)
+
+    def test_dual_local_negative_real_asset_coverage(self):
+        with open(
+            "stickerchat/processed/release_train_u_sticker_format_int.json",
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            train_rows = json.load(handle)
+        eligible_rows = []
+        for source in ("vpd_pack", "final_clip_pack_original"):
+            bank = GroupBank.load(
+                "artifacts/style_shapes/groups/stickerchat/%s/group_bank.json"
+                % source
+            )
+            sampler = StickerChatDualLocalNegativeSampler(
+                bank,
+                load_id_to_pack("stickerchat/processed/sticker_metadata.json"),
+                seed=2021,
+            )
+            manifest = build_eligibility_manifest(train_rows, sampler)
+            validate_eligibility_manifest(manifest)
+            self.assertEqual(manifest["total_rows"], 320168)
+            self.assertEqual(manifest["eligible_count"], 319876)
+            self.assertEqual(manifest["excluded_count"], 292)
+            self.assertEqual(
+                manifest["excluded_reason_counts"],
+                {"singleton_original_pack": 292},
+            )
+            eligible_rows.append(manifest["eligible_rows"])
+        self.assertEqual(eligible_rows[0], eligible_rows[1])
 
 
 if __name__ == "__main__":
