@@ -39,6 +39,7 @@ class StyleShapesDataModule(PLDataLoader):
         tokenizer,
         permutation_path: str,
         eligible_source_rows: Optional[Sequence[int]] = None,
+        fixed_candidate_runtime: Any = None,
     ):
         super().__init__(args, tokenizer)
         self.permutation_path = str(permutation_path)
@@ -47,6 +48,7 @@ class StyleShapesDataModule(PLDataLoader):
             if eligible_source_rows is None
             else [int(value) for value in eligible_source_rows]
         )
+        self.fixed_candidate_runtime = fixed_candidate_runtime
         self.permutation_manifest = None
         self._style_shapes_train_dataloader = None
 
@@ -68,7 +70,19 @@ class StyleShapesDataModule(PLDataLoader):
     def collate_fn(self, batch):
         value = super().collate_fn(batch)
         if "_style_shapes_source_row" in batch[0]:
-            value["source_rows"] = [int(item["_style_shapes_source_row"]) for item in batch]
+            rows = [int(item["_style_shapes_source_row"]) for item in batch]
+            value["source_rows"] = rows
+            if self.fixed_candidate_runtime is not None:
+                candidates, gray_mask = self.fixed_candidate_runtime.for_source_rows(
+                    rows
+                )
+                positives = [int(item) for item in value["img_ids"]]
+                if [int(row[0]) for row in candidates] != positives:
+                    raise RuntimeError(
+                        "fixed candidate source rows are not aligned with training gold IDs"
+                    )
+                value["train_candidate_ids"] = candidates
+                value["train_candidate_gray_mask"] = gray_mask
         return value
 
     def train_dataloader(self):
@@ -160,13 +174,17 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
         trace_dir: str = "",
         per_query_dir: str = "",
         negative_sampler: Any = None,
+        fixed_candidate_runtime: Any = None,
     ):
         self.style_shapes_membership_hash = str(membership_hash)
         self.style_shapes_trace_dir = str(trace_dir or "")
         self.style_shapes_per_query_dir = str(per_query_dir or "")
-        self.style_shapes_negative_policy = (
-            str(getattr(negative_sampler, "policy", "prototype_cross_plus_same"))
-        )
+        if fixed_candidate_runtime is not None:
+            self.style_shapes_negative_policy = str(fixed_candidate_runtime.policy)
+        else:
+            self.style_shapes_negative_policy = str(
+                getattr(negative_sampler, "policy", "prototype_cross_plus_same")
+            )
         self.style_shapes_neighbor_trace_field = str(
             getattr(negative_sampler, "neighbor_trace_field", "")
         )
@@ -179,6 +197,7 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
         self._style_shapes_latency_ms = []
         self._style_shapes_refresh_ms = []
         self._style_shapes_num_training_steps = None
+        self._style_shapes_last_train_debug = None
         super().__init__(args)
         original_factorization = self.model._compute_bank_factorization
 
@@ -198,6 +217,11 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
         if negative_sampler is not None:
             negative_sampler.install(self.model)
         _install_negative_trace_hook(self, self.model)
+
+    def run_train_batch(self, batch: Dict[str, Any]):
+        output = super().run_train_batch(batch)
+        self._style_shapes_last_train_debug = output.debug_info
+        return output
 
 
     @property
@@ -242,6 +266,69 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         loss = super().training_step(batch, batch_idx)
         if self._style_shapes_trace_handle is not None:
+            if "train_candidate_ids" in batch:
+                debug = self._style_shapes_last_train_debug
+                if not isinstance(debug, dict):
+                    raise RuntimeError("listwise training did not expose score trace data")
+                rows = batch["source_rows"]
+                positives = batch["img_ids"]
+                candidates = debug["candidate_ids"].detach().cpu().tolist()
+                gray_masks = debug["gray_mask"].detach().cpu().tolist()
+                base_scores = debug["base_scores"].detach().float().cpu().tolist()
+                expression_scores = (
+                    debug["expression_scores"].detach().float().cpu().tolist()
+                )
+                group_scores = (
+                    debug["group_scores"].detach().float().cpu().tolist()
+                )
+                final_scores = debug["final_scores"].detach().float().cpu().tolist()
+                hardest_indices = (
+                    debug["hardest_expression_indices"].detach().cpu().tolist()
+                )
+                hardest_ids = (
+                    debug["hardest_expression_ids"].detach().cpu().tolist()
+                )
+                if not (
+                    len(rows)
+                    == len(positives)
+                    == len(candidates)
+                    == len(gray_masks)
+                    == len(base_scores)
+                    == len(expression_scores)
+                    == len(group_scores)
+                    == len(final_scores)
+                    == len(hardest_indices)
+                    == len(hardest_ids)
+                ):
+                    raise RuntimeError("fixed listwise trace fields are not aligned")
+                for index, source_row in enumerate(rows):
+                    record = {
+                        "epoch": int(self.current_epoch),
+                        "global_step": int(self.global_step),
+                        "rank": int(getattr(self, "global_rank", 0)),
+                        "source_row": int(source_row),
+                        "positive": int(positives[index]),
+                        "negative_policy": self.style_shapes_negative_policy,
+                        "candidate_ids": [int(item) for item in candidates[index]],
+                        "gray_mask": [bool(item) for item in gray_masks[index]],
+                        "base_scores": [float(item) for item in base_scores[index]],
+                        "expression_scores": [
+                            float(item) for item in expression_scores[index]
+                        ],
+                        "group_scores": [float(item) for item in group_scores[index]],
+                        "final_scores": [float(item) for item in final_scores[index]],
+                        "hardest_expression_index": int(hardest_indices[index]),
+                        "hardest_expression_id": int(hardest_ids[index]),
+                        "candidate_forward_chunk_size": int(
+                            debug["candidate_forward_chunk_size"]
+                        ),
+                        "membership_hash": self.style_shapes_membership_hash,
+                    }
+                    self._style_shapes_trace_handle.write(
+                        json.dumps(record, sort_keys=True, separators=(",", ":"))
+                        + "\n"
+                    )
+                return loss
             if self._style_shapes_last_negatives is None:
                 raise RuntimeError("negative resolver did not expose the actual sampled negatives")
             cross, same = self._style_shapes_last_negatives
@@ -336,6 +423,12 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
                 {
                     "query_index": len(self._style_shapes_query_scores),
                     "candidate_ids": ordered,
+                    "gray_mask": [
+                        bool(item)
+                        for item in debug.get(
+                            "gray_mask", [item == -1 for item in ordered]
+                        )
+                    ],
                     "gold": gold,
                     "positive_index": ordered.index(gold),
                     "base_scores": [float(item) for item in debug["mmbert_score_per_cand"]],
@@ -360,6 +453,33 @@ class StyleShapesPLModel(StructuredFactorizedPLModel):
             rank = int(getattr(self, "global_rank", 0))
             path = Path(self.style_shapes_per_query_dir) / ("rank_%02d_scores.json" % rank)
             atomic_write_json(path, self._style_shapes_query_scores)
+            ranks = [
+                int(item["rank"]) for item in self._style_shapes_query_scores
+            ]
+            query_count = len(ranks)
+            mrr = sum(1.0 / float(rank_value) for rank_value in ranks) / float(
+                query_count
+            )
+            atomic_write_json(
+                Path(self.style_shapes_per_query_dir)
+                / ("rank_%02d_metrics.json" % rank),
+                {
+                    "queries": query_count,
+                    "r_at_1": sum(value <= 1 for value in ranks)
+                    / float(query_count),
+                    "r_at_2": sum(value <= 2 for value in ranks)
+                    / float(query_count),
+                    "r_at_5": sum(value <= 5 for value in ranks)
+                    / float(query_count),
+                    "r_at_10": sum(value <= 10 for value in ranks)
+                    / float(query_count),
+                    "mrr": mrr,
+                    "map": mrr,
+                    "map_equals_mrr": True,
+                    "single_positive_protocol": True,
+                    "membership_hash": self.style_shapes_membership_hash,
+                },
+            )
             values = sorted(self._style_shapes_latency_ms)
             p95 = values[min(len(values) - 1, int(0.95 * len(values)))] if values else None
             atomic_write_json(

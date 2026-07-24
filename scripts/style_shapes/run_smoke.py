@@ -28,6 +28,10 @@ from structured_retrieval import load_checkpoint_to_model, move_batch_to_device
 from structured_retrieval_factorized import parse_structured_factorized_args
 from structured_retrieval_tokens import _config_mapping_to_argv
 from style_shapes.group_bank import GroupBank
+from style_shapes.fixed_same_pack import (
+    flatten_query_major,
+    load_fixed_same_pack_runtime,
+)
 from style_shapes.io import atomic_write_json, command_record, sha256_file
 from style_shapes.negative_sampling import (
     load_dual_local_runtime,
@@ -103,6 +107,12 @@ def _score_record(labels, debug: dict, membership_hash: str) -> dict:
     return {
         "query_index": 0,
         "candidate_ids": candidate_ids,
+        "gray_mask": [
+            bool(value)
+            for value in debug.get(
+                "gray_mask", [value == -1 for value in candidate_ids]
+            )
+        ],
         "gold": gold,
         "positive_index": positive_index,
         "base_scores": [float(value) for value in debug["mmbert_score_per_cand"]],
@@ -145,6 +155,7 @@ def main() -> None:
         if str(model_args.factorized_variant) != "minimal":
             raise RuntimeError("smoke requires the v6 minimal core")
         negative_sampler = None
+        fixed_candidate_runtime = None
         eligibility_manifest = None
         eligible_source_rows = None
         if config.get("negative_sampling") is not None:
@@ -161,6 +172,19 @@ def main() -> None:
                 {
                     "negative_policy": negative_sampler.policy,
                     "eligibility_manifest_hash": eligibility_manifest["manifest_hash"],
+                }
+            )
+        if config.get("fixed_candidates") is not None:
+            fixed_candidate_runtime = load_fixed_same_pack_runtime(
+                config["fixed_candidates"],
+                train_data_path=model_args.train_data_path,
+            )
+            expected.update(
+                {
+                    "negative_policy": fixed_candidate_runtime.policy,
+                    "fixed_candidate_manifest_hash": (
+                        fixed_candidate_runtime.manifest["manifest_hash"]
+                    ),
                 }
             )
         if manifest_path.exists():
@@ -182,6 +206,7 @@ def main() -> None:
             model_args,
             membership_hash=bank.membership_hash,
             negative_sampler=negative_sampler,
+            fixed_candidate_runtime=fixed_candidate_runtime,
         )
         load_checkpoint_to_model(model, str(init_path), strict=True)
         model.to(device)
@@ -195,21 +220,113 @@ def main() -> None:
             model.model.bert_tokenizer,
             config["permutation_manifest"],
             eligible_source_rows=eligible_source_rows,
+            fixed_candidate_runtime=fixed_candidate_runtime,
         )
         data.setup("fit")
-        batch = move_batch_to_device(next(iter(data.train_dataloader())), device)
+        raw_batch = next(iter(data.train_dataloader()))
+        smoke_forced_gray_source = None
+        if (
+            fixed_candidate_runtime is not None
+            and not any(
+                any(bool(value) for value in row)
+                for row in raw_batch["train_candidate_gray_mask"]
+            )
+        ):
+            gray_rows = torch.nonzero(
+                fixed_candidate_runtime.gray_mask.any(dim=1), as_tuple=False
+            ).reshape(-1)
+            if gray_rows.numel() == 0:
+                raise RuntimeError("fixed candidate manifest has no gray smoke row")
+            smoke_forced_gray_source = int(gray_rows[0].item())
+            source_rows = list(raw_batch["source_rows"])
+            source_rows[0] = smoke_forced_gray_source
+            raw_batch = data.collate_fn(
+                [data.train_dataset[index] for index in source_rows]
+            )
+        batch = move_batch_to_device(raw_batch, device)
+
+        vectorized_serial_max_abs_diff = None
+        if fixed_candidate_runtime is not None:
+            model.eval()
+            with torch.no_grad():
+                probe_batch = min(2, len(batch["img_ids"]))
+                probe_ids = torch.tensor(
+                    batch["train_candidate_ids"][:probe_batch],
+                    dtype=torch.long,
+                    device=device,
+                )
+                probe_input = batch["input_ids"][:probe_batch]
+                probe_mask = batch["attention_mask"][:probe_batch]
+                flat_input, flat_mask, flat_ids = flatten_query_major(
+                    probe_input, probe_mask, probe_ids
+                )
+                bank_h = model.model.get_factorized_bank_img_embs(device)
+                flat_id_list = [int(value) for value in flat_ids.cpu().tolist()]
+                flat_h = model.model._candidate_embeddings_from_bank(
+                    bank_h, flat_id_list
+                )
+                vectorized = model.model.compute_base_score(
+                    model.model._compute_pair_logits(
+                        flat_input, flat_mask, flat_id_list, flat_h
+                    )
+                ).reshape(probe_batch, -1)
+                serial_columns = []
+                for column in range(probe_ids.size(1)):
+                    column_ids = [
+                        int(value)
+                        for value in probe_ids[:, column].cpu().tolist()
+                    ]
+                    column_h = model.model._candidate_embeddings_from_bank(
+                        bank_h, column_ids
+                    )
+                    serial_columns.append(
+                        model.model.compute_base_score(
+                            model.model._compute_pair_logits(
+                                probe_input,
+                                probe_mask,
+                                column_ids,
+                                column_h,
+                            )
+                        )
+                    )
+                serial = torch.stack(serial_columns, dim=1)
+                vectorized_serial_max_abs_diff = float(
+                    (vectorized - serial).abs().max().cpu().item()
+                )
+                # CUDA GEMM kernels may choose a different accumulation order
+                # when the effective batch changes from B to B*N. The functions
+                # must be equivalent within normal float32 inference tolerance.
+                if not torch.allclose(
+                    vectorized, serial, rtol=1e-3, atol=1e-3
+                ):
+                    raise RuntimeError(
+                        "vectorized and serial candidate scores differ by %.8f"
+                        % vectorized_serial_max_abs_diff
+                    )
+            model.train()
 
         optimizer, scheduler = _optimizer(model, model_args)
         optimizer.zero_grad()
         started = time.perf_counter()
-        result = model.model.forward_train_batch(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            img_ids=batch["img_ids"],
-            neg_img_ids=batch["neg_img_ids"],
-            global_step=0,
-            total_steps=1,
-        )
+        if fixed_candidate_runtime is not None:
+            result = model.model.forward_train_listwise_batch(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                img_ids=batch["img_ids"],
+                candidate_ids=batch["train_candidate_ids"],
+                gray_mask=batch["train_candidate_gray_mask"],
+                global_step=0,
+                total_steps=1,
+            )
+        else:
+            result = model.model.forward_train_batch(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                img_ids=batch["img_ids"],
+                neg_img_ids=batch["neg_img_ids"],
+                global_step=0,
+                total_steps=1,
+            )
         loss = result.loss
         if not bool(torch.isfinite(loss).item()):
             raise RuntimeError("non-finite smoke loss")
@@ -229,37 +346,74 @@ def main() -> None:
             torch.cuda.synchronize(device)
         train_seconds = time.perf_counter() - started
 
-        cross, same = model._style_shapes_last_negatives or (None, None)
-        if cross is None or same is None:
-            raise RuntimeError("smoke did not capture actual group-aware negatives")
         trace = []
-        for source_row, positive, fallback, cross_id, same_id in zip(
-            batch["source_rows"],
-            batch["img_ids"],
-            batch["neg_img_ids"],
-            cross,
-            same,
-        ):
-            record = {
-                "source_row": int(source_row),
-                "positive": int(positive),
-                "fallback": int(fallback),
-                "cross": int(cross_id),
-                "same": int(same_id),
-                "membership_hash": bank.membership_hash,
-            }
-            if negative_sampler is not None:
-                record.update(
+        if fixed_candidate_runtime is not None:
+            debug = result.debug_info
+            candidate_rows = debug["candidate_ids"].detach().cpu().tolist()
+            gray_rows = debug["gray_mask"].detach().cpu().tolist()
+            group_rows = debug["group_scores"].detach().float().cpu().tolist()
+            hardest_ids = debug["hardest_expression_ids"].detach().cpu().tolist()
+            for source_row, positive, candidates, gray, group, hardest in zip(
+                batch["source_rows"],
+                batch["img_ids"],
+                candidate_rows,
+                gray_rows,
+                group_rows,
+                hardest_ids,
+            ):
+                if int(candidates[0]) != int(positive):
+                    raise RuntimeError("fixed smoke trace gold is misaligned")
+                if any(
+                    float(group[index]) != 0.0
+                    for index, is_gray in enumerate(gray)
+                    if bool(is_gray)
+                ):
+                    raise RuntimeError("gray smoke candidate received nonzero group score")
+                trace.append(
                     {
-                        "negative_policy": negative_sampler.policy,
-                        "group_top32": int(cross_id),
-                        "same_pack": int(same_id),
-                        "fallback_used": False,
+                        "source_row": int(source_row),
+                        "positive": int(positive),
+                        "negative_policy": fixed_candidate_runtime.policy,
+                        "candidate_ids": [int(value) for value in candidates],
+                        "gray_mask": [bool(value) for value in gray],
+                        "group_scores": [float(value) for value in group],
+                        "hardest_expression_id": int(hardest),
+                        "membership_hash": bank.membership_hash,
                     }
                 )
-                record[negative_sampler.neighbor_trace_field] = int(cross_id)
-                validate_dual_local_trace_record(record, negative_sampler)
-            trace.append(record)
+        else:
+            cross, same = model._style_shapes_last_negatives or (None, None)
+            if cross is None or same is None:
+                raise RuntimeError(
+                    "smoke did not capture actual group-aware negatives"
+                )
+            for source_row, positive, fallback, cross_id, same_id in zip(
+                batch["source_rows"],
+                batch["img_ids"],
+                batch["neg_img_ids"],
+                cross,
+                same,
+            ):
+                record = {
+                    "source_row": int(source_row),
+                    "positive": int(positive),
+                    "fallback": int(fallback),
+                    "cross": int(cross_id),
+                    "same": int(same_id),
+                    "membership_hash": bank.membership_hash,
+                }
+                if negative_sampler is not None:
+                    record.update(
+                        {
+                            "negative_policy": negative_sampler.policy,
+                            "group_top32": int(cross_id),
+                            "same_pack": int(same_id),
+                            "fallback_used": False,
+                        }
+                    )
+                    record[negative_sampler.neighbor_trace_field] = int(cross_id)
+                    validate_dual_local_trace_record(record, negative_sampler)
+                trace.append(record)
         atomic_write_json(output / "negative_trace.json", trace)
 
         checkpoint_path = output / "one_step.ckpt"
@@ -286,6 +440,7 @@ def main() -> None:
         reloaded = StyleShapesPLModel(
             model_args,
             membership_hash=bank.membership_hash,
+            fixed_candidate_runtime=fixed_candidate_runtime,
         )
         load_checkpoint_to_model(reloaded, str(checkpoint_path), strict=True)
         reloaded.to(device)
@@ -316,9 +471,13 @@ def main() -> None:
             "dataset": config["dataset"],
             "group_source": config["group_source"],
             "negative_policy": (
-                negative_sampler.policy
-                if negative_sampler is not None
-                else "prototype_cross_plus_same"
+                fixed_candidate_runtime.policy
+                if fixed_candidate_runtime is not None
+                else (
+                    negative_sampler.policy
+                    if negative_sampler is not None
+                    else "prototype_cross_plus_same"
+                )
             ),
             **expected,
             "checkpoint": {
@@ -332,6 +491,14 @@ def main() -> None:
                 "loss": loss_value,
                 "gradient_tensors_nonzero": grad_nonzero,
                 "wall_seconds": train_seconds,
+                "vectorized_serial_max_abs_diff_eval_mode": (
+                    vectorized_serial_max_abs_diff
+                ),
+                "gray_slots_exercised": sum(
+                    sum(bool(value) for value in row)
+                    for row in batch.get("train_candidate_gray_mask", [])
+                ),
+                "forced_gray_source_row": smoke_forced_gray_source,
             },
             "eval": {
                 "queries": 1,

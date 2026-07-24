@@ -25,6 +25,28 @@ neighbor. `vpd_pack_dual_local_negatives` uses the VPD membership;
 `final_clip_pack_original` membership. Both filter singleton raw-pack positives and have no
 fallback.
 
+Two further isolated fixed-listwise variants are
+`stickerchat_vpd_pack_fixed_same_pack_r10` and
+`stickerchat_semsp_fixed_same_pack_r10`. They retain all 320,168 training rows and replace the
+legacy three-candidate match objective with one gold plus nine frozen original-pack candidates.
+The gold is candidate 0. After removing the gold by normalized external ID, negatives are the
+first nine remaining `emoji_mapping.txt` entries in original order. Missing slots use sentinel
+ID `-1` backed by one frozen RGB-127 CLIP embedding. Sentinel candidates receive ordinary
+MM-BERT and expression scores but a group score of exactly zero.
+
+The raw archive contains two empty `emoji_mapping.txt` files. This upstream defect is handled
+declaratively: only for those empty files, `.npy` entries are read in original ZIP member order.
+The fallback packs and content hash are recorded in the candidate manifest. Any other missing
+pack, sticker mapping, processed-row alignment, or input-hash mismatch is fatal.
+
+Fixed-listwise training performs one query-major vectorized MM-BERT call for `[B,10]` candidates
+by flattening to `[B*10]`. Its main loss is 10-way cross entropy. The expression auxiliary uses
+only the highest expression-scoring negative, while the main cross entropy continues to give all
+nine negatives probability-weighted gradients. Prototype supervision, orthogonality, additive
+fusion, parameterization, initialization, optimizer, scheduler, batch size, and epoch order are
+unchanged. Candidate chunk 10 is the default; 5, 2, then 1 are permitted only after a recorded
+OOM.
+
 All variants of a dataset must strict-load the same weights-only initialization snapshot, use
 the same epoch permutations, fixed candidates, optimizer recipe, and hardware allocation.
 
@@ -75,6 +97,12 @@ Training uses seed 2021, 10 epochs, per-device batch 16, lambdas 0.3/0.4/0.5, Ad
 0.9/0.98, weight decay 0.2, existing two learning rates and cosine schedule, no warmup or early
 stopping. DSTC refresh is exact (`0`), StickerChat refresh is `500`. Final checkpoints alone are
 used for formal evaluation.
+
+The fixed-listwise primary evaluation is the clean fixed same-pack Test R10. The existing random
+same-pack Test R10 and global-random Test R20 are mandatory generalization checks. Every
+single-positive score export reports both MRR and MAP and asserts `MAP == MRR`. Old checkpoints
+must also be evaluated on the clean fixed R10 without retraining so candidate-protocol effects
+are separated from ten-candidate training effects.
 
 Paired query bootstrap uses 10,000 resamples, seed 2021. The preregistered efficacy, size,
 coverage, and non-inferiority gates are exactly those in `STYLE_SHAPES_EXEC_PLAN.md`. A failed

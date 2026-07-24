@@ -23,6 +23,7 @@ data/*
 !data/ocr_max10.json
 u-sticker/
 stickerchat/
+external_data/
 
 # Training / evaluation outputs
 logs/

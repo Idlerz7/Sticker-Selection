@@ -1,6 +1,6 @@
 # Style Shapes Living Execution Plan
 
-Last update: 2026-07-23 16:10 UTC
+Last update: 2026-07-24 21:25 UTC
 
 ## Immutable inputs
 
@@ -30,6 +30,9 @@ Last update: 2026-07-23 16:10 UTC
 | DSTC formal pilot | RESOURCE_BLOCKED | Requires four equivalent free A800 GPUs |
 | StickerChat formal pilot | RESOURCE_BLOCKED | Requires eight equivalent free A800 GPUs |
 | Bootstrap and final verdict | NOT_EVALUATED | No formal query scores; no research claim |
+| Fixed same-pack R10 assets | COMPLETE | 320,168/10,000/10,000 rows; gray counts and hashes frozen |
+| Fixed-listwise VPD/SEMSP engineering | PASS | Batch-16 160-pair forward/backward and strict reload pass on both banks |
+| Fixed-listwise formal training | NOT_STARTED | Run the two independent 10-epoch configs; smoke is not a result |
 
 At final resource audit fewer than four equivalent A800s were free. Occupied GPUs were not preempted.
 The formal matrix is RESOURCE_BLOCKED and no historical or smoke metric is substituted.
@@ -47,6 +50,21 @@ optimization recipe, evaluation candidates, 319,876 eligible rows, and 292 singl
 exclusions. They differ only in the group bank used for the second top-32 negative: VPD
 membership versus original SEMSP `final_clip_pack_original` membership. Neither is part of
 the preregistered group-source comparison matrix.
+
+The isolated fixed-listwise matrix contains:
+
+- `stickerchat_vpd_pack_fixed_same_pack_r10`, using the VPD pack bank;
+- `stickerchat_semsp_fixed_same_pack_r10`, using the original SEMSP
+  `final_clip_pack_original` bank.
+
+Both reuse the same 320,168-row permutation, seed-2021 initialization, fixed candidate manifest,
+batch size 16, and optimizer recipe. Frozen asset counts are Train
+`320,168 / 5,803 gray rows / 27,828 gray slots`, Validation
+`10,000 / 163 / 826`, and Test `10,000 / 164 / 776`. The candidate builder records two raw
+empty-mapping packs and their ZIP-member-order fallback rather than hiding the upstream defect.
+Engineering smoke passed for both group banks with 160 pairs in one vectorized forward,
+nonzero backward gradients, unchanged state-dict keys/parameter count, and strict checkpoint
+reload. No formal metric has been generated.
 
 Every dataset-level variant shares the initialization hash, epoch-permutation hash, batch size,
 candidate order, and hardware conditions. Each rank writes an atomic negative trace containing

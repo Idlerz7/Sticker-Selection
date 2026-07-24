@@ -59,8 +59,15 @@ def merge_and_validate_traces(
             raise ValueError("trace membership hash mismatch")
         key = (int(record["epoch"]), int(record["source_row"]))
         counts[key] += 1
-        for name in ("positive", "fallback", "cross", "same"):
-            int(record[name])
+        int(record["positive"])
+        if "candidate_ids" in record:
+            if any(name in record for name in ("fallback", "cross", "same")):
+                raise ValueError(
+                    "fixed listwise trace must not masquerade as a legacy triplet"
+                )
+        else:
+            for name in ("fallback", "cross", "same"):
+                int(record[name])
         if record_validator is not None:
             record_validator(record)
     if expected_source_rows is None:

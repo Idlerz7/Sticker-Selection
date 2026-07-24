@@ -33,6 +33,10 @@ from style_shapes.contracts import (
     training_completion_errors,
 )
 from style_shapes.group_bank import GroupBank
+from style_shapes.fixed_same_pack import (
+    FIXED_SAME_PACK_POLICY,
+    load_fixed_same_pack_runtime,
+)
 from style_shapes.io import atomic_write_json, command_record, sha256_file
 from style_shapes.negative_sampling import (
     DUAL_LOCAL_GROUP_SOURCE_BY_POLICY,
@@ -93,10 +97,16 @@ def verify_contract(config, model_args, bank):
     if config["dataset"] == "stickerchat" and int(model_args.factorized_train_bank_refresh_steps) != 500:
         raise RuntimeError("StickerChat requires bank refresh 500")
     if config["dataset"] == "stickerchat" and str(config.get("mode", "train")) == "train":
-        expected_r10 = (
-            "stickerchat/processed/"
-            "release_val_u_sticker_format_int_with_cand_same_pack_r10.json"
-        )
+        if str(model_args.factorized_train_mode) == FIXED_SAME_PACK_POLICY:
+            expected_r10 = (
+                "stickerchat/processed/"
+                "release_val_u_sticker_format_int_with_cand_fixed_same_pack_r10.json"
+            )
+        else:
+            expected_r10 = (
+                "stickerchat/processed/"
+                "release_val_u_sticker_format_int_with_cand_same_pack_r10.json"
+            )
         expected_r20 = (
             "stickerchat/processed/release_val_u_sticker_format_int_with_cand_r20.json"
         )
@@ -105,6 +115,11 @@ def verify_contract(config, model_args, bank):
         if str(model_args.per_epoch_eval_test_r20_path) != expected_r20:
             raise RuntimeError("StickerChat training requires fixed global-random R20 validation")
     negative_config = config.get("negative_sampling")
+    fixed_config = config.get("fixed_candidates")
+    if negative_config is not None and fixed_config is not None:
+        raise RuntimeError(
+            "negative_sampling and fixed_candidates are mutually exclusive"
+        )
     if negative_config is not None:
         negative_policy = str(negative_config.get("mode", ""))
         if negative_policy not in DUAL_LOCAL_POLICIES:
@@ -124,6 +139,35 @@ def verify_contract(config, model_args, bank):
             raise RuntimeError("dual-local negatives require one cross-slot negative")
         if bool(getattr(model_args, "factorized_train_mmbert_two_way", False)):
             raise RuntimeError("dual-local negatives require the three-candidate match loss")
+    if fixed_config is not None:
+        if config["dataset"] != "stickerchat":
+            raise RuntimeError("fixed same-pack candidates are StickerChat-only")
+        if str(fixed_config.get("mode", "")) != FIXED_SAME_PACK_POLICY:
+            raise RuntimeError("unsupported fixed-candidate policy")
+        if str(model_args.factorized_train_mode) != FIXED_SAME_PACK_POLICY:
+            raise RuntimeError(
+                "fixed candidate runtime requires factorized_train_mode="
+                + FIXED_SAME_PACK_POLICY
+            )
+        if int(model_args.factorized_train_candidate_count) != 10:
+            raise RuntimeError("fixed same-pack training requires 10 candidates")
+        if int(model_args.factorized_candidate_forward_chunk_size) not in {
+            10,
+            5,
+            2,
+            1,
+        }:
+            raise RuntimeError(
+                "candidate chunk must follow the registered OOM sequence 10/5/2/1"
+            )
+        if bool(model_args.add_ocr_info):
+            raise RuntimeError(
+                "gray sentinel candidates require add_ocr_info=false"
+            )
+    elif str(model_args.factorized_train_mode) != "legacy_triplet":
+        raise RuntimeError(
+            "non-legacy factorized_train_mode requires fixed_candidates config"
+        )
 
 
 def save_checkpoint_atomic(trainer, path):
@@ -189,6 +233,7 @@ def main():
         model_args = build_model_args(config)
         verify_contract(config, model_args, bank)
         negative_sampler = None
+        fixed_candidate_runtime = None
         eligibility_manifest = None
         eligible_source_rows = None
         if config.get("negative_sampling") is not None:
@@ -207,6 +252,19 @@ def main():
             ):
                 raise RuntimeError(
                     "dual-local permutation rows do not match eligible training rows"
+                )
+        if config.get("fixed_candidates") is not None:
+            fixed_candidate_runtime = load_fixed_same_pack_runtime(
+                config["fixed_candidates"],
+                train_data_path=model_args.train_data_path,
+            )
+            if (
+                mode == "train"
+                and int(runtime_permutation["num_rows"])
+                != int(fixed_candidate_runtime.candidate_ids.size(0))
+            ):
+                raise RuntimeError(
+                    "fixed-candidate permutation rows do not match training rows"
                 )
         pl.seed_everything(int(model_args.seed))
         output = Path(config["output_dir"])
@@ -240,6 +298,19 @@ def main():
                         and existing.get("eligibility_manifest", {}).get("manifest_hash")
                         == eligibility_manifest["manifest_hash"]
                     )
+                if compatible and fixed_candidate_runtime is not None:
+                    compatible = (
+                        existing.get("negative_policy")
+                        == FIXED_SAME_PACK_POLICY
+                        and existing.get("fixed_candidate_manifest", {}).get(
+                            "manifest_hash"
+                        )
+                        == fixed_candidate_runtime.manifest["manifest_hash"]
+                        and int(
+                            existing.get("candidate_forward_chunk_size", -1)
+                        )
+                        == int(model_args.factorized_candidate_forward_chunk_size)
+                    )
             if mode == "test" and compatible:
                 compatible = (
                     checkpoint_path and Path(checkpoint_path).exists()
@@ -250,6 +321,11 @@ def main():
                     compatible = (
                         existing.get("negative_policy")
                         == str(config["negative_sampling"]["mode"])
+                    )
+                if compatible and fixed_candidate_runtime is not None:
+                    compatible = (
+                        existing.get("negative_policy")
+                        == FIXED_SAME_PACK_POLICY
                     )
             if not compatible:
                 raise RuntimeError(
@@ -268,6 +344,7 @@ def main():
             trace_dir=str(output / "negative_trace") if mode == "train" else "",
             per_query_dir=per_query_dir,
             negative_sampler=negative_sampler,
+            fixed_candidate_runtime=fixed_candidate_runtime,
         )
         if mode == "train":
             if not init_path:
@@ -284,6 +361,7 @@ def main():
                 model.model.bert_tokenizer,
                 config["permutation_manifest"],
                 eligible_source_rows=eligible_source_rows,
+                fixed_candidate_runtime=fixed_candidate_runtime,
             )
             trainer = build_final_only_trainer(model_args, for_train=True)
             attach_version_log_from_trainer(model_args, trainer)
@@ -363,6 +441,25 @@ def main():
                         },
                     }
                 )
+            if fixed_candidate_runtime is not None:
+                result.update(
+                    {
+                        "negative_policy": FIXED_SAME_PACK_POLICY,
+                        "fixed_candidate_manifest": {
+                            "path": config["fixed_candidates"]["manifest_path"],
+                            "sha256": sha256_file(
+                                config["fixed_candidates"]["manifest_path"]
+                            ),
+                            "manifest_hash": fixed_candidate_runtime.manifest[
+                                "manifest_hash"
+                            ],
+                        },
+                        "candidate_count": 10,
+                        "candidate_forward_chunk_size": int(
+                            model_args.factorized_candidate_forward_chunk_size
+                        ),
+                    }
+                )
         elif mode == "test":
             if int(model_args.gpus) != 1:
                 raise RuntimeError("formal final evaluation must run on one GPU")
@@ -391,6 +488,11 @@ def main():
             if config.get("negative_sampling") is not None:
                 result["negative_policy"] = str(
                     config["negative_sampling"]["mode"]
+                )
+            if fixed_candidate_runtime is not None:
+                result["negative_policy"] = FIXED_SAME_PACK_POLICY
+                result["fixed_candidate_manifest_hash"] = (
+                    fixed_candidate_runtime.manifest["manifest_hash"]
                 )
         else:
             raise ValueError("mode must be train or test")

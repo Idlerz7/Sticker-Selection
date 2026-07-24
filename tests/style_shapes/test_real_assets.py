@@ -14,6 +14,11 @@ from style_shapes.builders import (
 )
 from style_shapes.clustering import legacy_pack_kmeans
 from style_shapes.group_bank import GroupBank
+from style_shapes.fixed_same_pack import (
+    EXPECTED_SPLIT_STATS,
+    load_fixed_same_pack_runtime,
+    validate_fixed_manifest,
+)
 from style_shapes.io import sha256_file
 from style_shapes.negative_sampling import (
     StickerChatDualLocalNegativeSampler,
@@ -156,6 +161,38 @@ class RealAssetIntegrationTest(unittest.TestCase):
             )
             eligible_rows.append(manifest["eligible_rows"])
         self.assertEqual(eligible_rows[0], eligible_rows[1])
+
+    def test_fixed_same_pack_r10_real_asset_contract(self):
+        manifest_path = (
+            "artifacts/style_shapes/candidates/"
+            "stickerchat_fixed_same_pack_r10/manifest.json"
+        )
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        validate_fixed_manifest(manifest, verify_files=True)
+        for split, expected in EXPECTED_SPLIT_STATS.items():
+            observed = manifest["splits"][split]["stats"]
+            self.assertEqual(observed["rows"], expected["rows"])
+            self.assertEqual(observed["gray_rows"], expected["gray_rows"])
+            self.assertEqual(observed["gray_slots"], expected["gray_slots"])
+        runtime = load_fixed_same_pack_runtime(
+            {
+                "mode": "fixed_same_pack_listwise",
+                "manifest_path": manifest_path,
+            },
+            train_data_path=(
+                "stickerchat/processed/"
+                "release_train_u_sticker_format_int.json"
+            ),
+        )
+        self.assertEqual(tuple(runtime.candidate_ids.shape), (320168, 10))
+        self.assertTrue(torch.equal(runtime.gray_mask, runtime.candidate_ids.eq(-1)))
+        for path in (
+            "configs/style_shapes/stickerchat_vpd_pack_fixed_same_pack_r10.yaml",
+            "configs/style_shapes/stickerchat_semsp_fixed_same_pack_r10.yaml",
+        ):
+            with open(path, "r", encoding="utf-8") as handle:
+                self.assertIn(manifest_path, handle.read())
 
 
 if __name__ == "__main__":

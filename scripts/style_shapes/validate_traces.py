@@ -15,6 +15,11 @@ if str(REPO) not in sys.path:
 
 from style_shapes.io import command_record
 from style_shapes.group_bank import GroupBank
+from style_shapes.fixed_same_pack import (
+    FIXED_SAME_PACK_POLICY,
+    load_fixed_same_pack_runtime,
+    validate_fixed_trace_record,
+)
 from style_shapes.negative_sampling import (
     StickerChatDualLocalNegativeSampler,
     load_eligibility_manifest,
@@ -34,6 +39,7 @@ def main():
     parser.add_argument("--eligibility-manifest")
     parser.add_argument("--pack-metadata")
     parser.add_argument("--group-bank")
+    parser.add_argument("--fixed-candidate-manifest")
     parser.add_argument("--artifact-root", default="artifacts/style_shapes")
     args = parser.parse_args()
     with command_record(args, args.artifact_root):
@@ -42,6 +48,10 @@ def main():
             raise FileNotFoundError("no trace files matched")
         expected_source_rows = None
         record_validator = None
+        if args.eligibility_manifest and args.fixed_candidate_manifest:
+            raise ValueError(
+                "--eligibility-manifest and --fixed-candidate-manifest are mutually exclusive"
+            )
         if args.eligibility_manifest:
             if not args.pack_metadata or not args.group_bank:
                 raise ValueError(
@@ -55,6 +65,19 @@ def main():
             )
             record_validator = lambda record: validate_dual_local_trace_record(
                 record, sampler
+            )
+        elif args.fixed_candidate_manifest:
+            runtime = load_fixed_same_pack_runtime(
+                {
+                    "mode": FIXED_SAME_PACK_POLICY,
+                    "manifest_path": args.fixed_candidate_manifest,
+                }
+            )
+            expected_source_rows = list(
+                range(int(runtime.candidate_ids.size(0)))
+            )
+            record_validator = lambda record: validate_fixed_trace_record(
+                record, runtime
             )
         elif args.num_rows is None:
             raise ValueError("--num-rows is required without --eligibility-manifest")

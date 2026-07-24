@@ -8,6 +8,8 @@ All commands append start/finish provenance to
 conda run -n stickr-select python \
   scripts/style_shapes/build_stickerchat_same_pack_candidates.py
 conda run -n stickr-select python \
+  scripts/style_shapes/build_stickerchat_fixed_same_pack_candidates.py
+conda run -n stickr-select python \
   scripts/style_shapes/build_stickerchat_dual_negative_assets.py
 conda run -n stickr-select python \
   scripts/style_shapes/build_stickerchat_dual_negative_assets.py \
@@ -71,6 +73,53 @@ CUDA_VISIBLE_DEVICES=<visible-gpus> conda run -n stickr-select python \
 The same-pack negative occupies the factorized `same` slot and receives `expr_rank_loss`;
 the VPD or SEMSP top-32 negative occupies the `cross` slot. The original dataset
 `neg_img_id` is recorded as provenance but never used as a fallback.
+
+The fixed-listwise experiment is independent of both the legacy sampler and the dual-local
+experiment. Build its shared Train/Validation/Test manifest once, then run either bank:
+
+```bash
+conda run -n stickr-select python \
+  scripts/style_shapes/build_stickerchat_fixed_same_pack_candidates.py
+
+CUDA_VISIBLE_DEVICES=<visible-gpus> conda run -n stickr-select python \
+  scripts/style_shapes/run_pilot.py \
+  --config configs/style_shapes/stickerchat_vpd_pack_fixed_same_pack_r10.yaml
+
+CUDA_VISIBLE_DEVICES=<visible-gpus> conda run -n stickr-select python \
+  scripts/style_shapes/run_pilot.py \
+  --config configs/style_shapes/stickerchat_semsp_fixed_same_pack_r10.yaml
+```
+
+The number of visible GPUs is discovered at runtime. The default is query batch 16 and one
+vectorized 160-pair MM-BERT forward (`candidate_forward_chunk_size=10`). If and only if CUDA
+reports OOM, explicitly override the config in the registered order 5, 2, 1; lower the query
+batch only after all three fail.
+
+After the final checkpoint is written, evaluate all three mandatory protocols on one GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=<one-gpu> conda run -n stickr-select python \
+  scripts/style_shapes/evaluate_fixed_same_pack_suite.py \
+  --config configs/style_shapes/stickerchat_vpd_pack_fixed_same_pack_r10.yaml \
+  --checkpoint artifacts/style_shapes/pilot/stickerchat/vpd_pack_fixed_same_pack_r10/final.ckpt \
+  --output-dir artifacts/style_shapes/pilot/stickerchat/vpd_pack_fixed_same_pack_r10/evaluation_suite
+```
+
+Use the SEMSP config/checkpoint/output paths for its suite. To measure the protocol-only gain,
+run the same command with the corresponding old checkpoint and a separate `zero_train_old`
+output directory. The suite evaluates clean fixed same-pack R10, existing random same-pack R10,
+and global-random R20, and asserts single-positive `MAP == MRR`.
+
+Validate a completed fixed-listwise trace against the exact frozen candidate rows:
+
+```bash
+conda run -n stickr-select python scripts/style_shapes/validate_traces.py \
+  --trace-glob 'artifacts/style_shapes/pilot/stickerchat/vpd_pack_fixed_same_pack_r10/negative_trace/rank_*.jsonl' \
+  --epochs 10 \
+  --membership-hash b703e4be8c9899a54a621f574bfa96cac18f773a4fbad2632d4cedf5e3de758f \
+  --fixed-candidate-manifest artifacts/style_shapes/candidates/stickerchat_fixed_same_pack_r10/manifest.json \
+  --output artifacts/style_shapes/pilot/stickerchat/vpd_pack_fixed_same_pack_r10/negative_trace/validation.json
+```
 
 After a source finishes, run fixed-candidate evaluation on one GPU. DSTC keeps the legacy SEMSP
 R10 file. StickerChat uses same-pack R10 (global fallback only for the 163 validation / 164 test
