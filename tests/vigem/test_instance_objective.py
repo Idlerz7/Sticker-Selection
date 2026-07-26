@@ -39,6 +39,18 @@ class InstanceObjectiveTest(unittest.TestCase):
         self.assertEqual(eligible.tolist(), [False, True])
         self.assertEqual(scores.grad[0].tolist(), [0.0, 0.0])
 
+    def test_row_with_noninformative_gold_is_skipped(self):
+        scores = torch.tensor(
+            [[2.0, 1.0], [3.0, 0.0]], requires_grad=True
+        )
+        valid = torch.tensor([[False, True], [True, True]])
+        loss, eligible = masked_instance_listwise_loss(scores, valid)
+        loss.backward()
+        self.assertEqual(eligible.tolist(), [False, True])
+        self.assertEqual(scores.grad[0].tolist(), [0.0, 0.0])
+        self.assertLess(scores.grad[1, 0].item(), 0.0)
+        self.assertGreater(scores.grad[1, 1].item(), 0.0)
+
     def test_all_rows_ineligible_returns_differentiable_zero(self):
         scores = torch.randn(2, 3, requires_grad=True)
         valid = torch.tensor(

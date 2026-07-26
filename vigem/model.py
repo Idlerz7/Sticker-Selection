@@ -484,7 +484,7 @@ class VigemInstanceResidualStickerModel(StructuredFactorizedStickerModel):
         pos_tensor = torch.tensor(img_ids, dtype=torch.long, device=device)
         cross_tensor = torch.tensor(cross_ids, dtype=torch.long, device=device)
         same_tensor = torch.tensor(same_ids, dtype=torch.long, device=device)
-        pos_instance, pos_groups, pos_sizes, pos_info = (
+        pos_instance, pos_groups, _, pos_info = (
             self.compute_instance_scores(q_instance, pos_tensor)
         )
         cross_instance, _, _, _ = self.compute_instance_scores(
@@ -519,8 +519,10 @@ class VigemInstanceResidualStickerModel(StructuredFactorizedStickerModel):
         local_scores = torch.stack([pos_instance, same_instance], dim=-1)
         local_valid = torch.stack(
             [
-                pos_info & pos_sizes.gt(1),
-                same_info & same_groups.eq(pos_groups),
+                pos_info,
+                same_info
+                & same_groups.eq(pos_groups)
+                & same_tensor.ne(pos_tensor),
             ],
             dim=-1,
         )

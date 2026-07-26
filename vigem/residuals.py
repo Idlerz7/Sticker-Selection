@@ -195,15 +195,19 @@ def masked_instance_listwise_loss(
     scores: torch.Tensor,
     valid_mask: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """CE over gold and valid local negatives; skip rows without a real negative."""
+    """CE over valid gold/local negatives; skip non-informative rows.
+
+    A gold candidate can be intentionally invalid for the Instance objective
+    when its visual group is a singleton (and therefore its group-centred
+    residual is exactly zero).  Such rows still participate in the final and
+    group objectives, but must be skipped by this auxiliary loss.
+    """
     if scores.ndim != 2 or valid_mask.shape != scores.shape:
         raise ValueError("scores and valid_mask must have the same [B,N] shape")
     if scores.size(1) < 2:
         raise ValueError("instance listwise loss requires at least two candidates")
     valid_mask = valid_mask.bool()
-    if not bool(valid_mask[:, 0].all()):
-        raise ValueError("candidate 0 must be a valid gold for instance loss")
-    eligible = valid_mask[:, 1:].any(dim=1)
+    eligible = valid_mask[:, 0] & valid_mask[:, 1:].any(dim=1)
     if not bool(eligible.any()):
         return scores.sum() * 0.0, eligible
     selected_scores = scores[eligible]

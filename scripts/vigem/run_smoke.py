@@ -80,10 +80,35 @@ def main():
             fixed_candidate_runtime=fixed_runtime,
         )
         datamodule.setup("fit")
-        batch = move_batch_to_device(
-            next(iter(datamodule.train_dataloader())),
-            torch.device("cuda"),
-        )
+        train_loader = datamodule.train_dataloader()
+        singleton_gold_rows = 0
+        if config["dataset"] == "dstc":
+            # Exercise the formal DSTC edge case deliberately: singleton VPD
+            # groups have a zero residual and must skip Instance CE without
+            # skipping the final/group objectives for that row.
+            bundle = model.model._ensure_instance_bundle()
+            batch = None
+            for candidate_batch in train_loader:
+                positive_ids = torch.tensor(
+                    candidate_batch["img_ids"], dtype=torch.long
+                )
+                positive_groups = bundle.group_ids.index_select(
+                    0, positive_ids
+                )
+                singleton = bundle.group_sizes.index_select(
+                    0, positive_groups
+                ).eq(1)
+                if bool(singleton.any()) and bool((~singleton).any()):
+                    batch = candidate_batch
+                    singleton_gold_rows = int(singleton.sum().item())
+                    break
+            if batch is None:
+                raise RuntimeError(
+                    "DSTC smoke could not find a mixed singleton/non-singleton batch"
+                )
+        else:
+            batch = next(iter(train_loader))
+        batch = move_batch_to_device(batch, torch.device("cuda"))
         model.train()
         if "train_candidate_ids" in batch:
             output = model.model.forward_train_listwise_batch(
@@ -175,6 +200,7 @@ def main():
             "instance_score_std": debug["instance_score_stats"]["std"],
             "membership_hash": bank.membership_hash,
             "formal_batch_size_unchanged": int(formal_batch),
+            "singleton_gold_rows": int(singleton_gold_rows),
             "smoke_only": True,
         }
         output_path = Path(
