@@ -173,3 +173,24 @@ conda run -n stickr-select python scripts/style_shapes/validate_traces.py \
   --group-bank artifacts/style_shapes/groups/stickerchat/vpd_pack/group_bank.json \
   --output artifacts/style_shapes/pilot/stickerchat/vpd_pack_dual_local_negatives/negative_trace/validation.json
 ```
+### PBR released-code bug-compatible audit
+
+Formal StickerChat validation and test remain on the clean protocols.  The
+following audit-only commands reproduce the released PBR candidate bug without
+changing training or formal results:
+
+```bash
+conda run -n stickr-select python \
+  scripts/style_shapes/build_stickerchat_pbr_bug_candidates.py
+
+CUDA_VISIBLE_DEVICES=0 conda run -n stickr-select python \
+  scripts/style_shapes/evaluate_pbr_bug_compatible.py \
+  --config configs/style_shapes/stickerchat_vpd_pack_fixed_same_pack_r10.yaml \
+  --checkpoint artifacts/style_shapes/pilot/stickerchat/vpd_pack_fixed_same_pack_r10/final.ckpt
+```
+
+Candidate slot 0 remains the only positive label.  The audit intentionally
+fails to remove the extension-free gold ID from the first nine mapping entries,
+uses RGB=127 gray padding for short packs, and computes metrics with the NumPy
+sorting behavior in the released PBR `metrics.py`.  Outputs are marked
+`audit_only` and must never replace the clean fixed-same-pack result.
