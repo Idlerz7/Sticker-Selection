@@ -1,0 +1,9 @@
+extends: v6_00_minimal_core.yaml
+name: v6_00_ablate_no_expr_rank
+description: >
+  Ablation: disable instance-level expressive discrimination (expr_rank / margin ranking loss) via lambda_expr=0.
+  Keeps style_proto and orth losses at v6 minimal-core strengths.
+pl_root_dir: logs/structured_factorized_v6_00_ablate_no_expr_rank
+
+lambda_expr: 0.0
+# lambda_style_proto / lambda_orth inherited from v6_00_minimal_core (0.4 / 0.5)

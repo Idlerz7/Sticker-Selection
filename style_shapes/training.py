@@ -1,0 +1,528 @@
+"""Fair-pilot DataModule, trace writer, score exporter, and final-only trainer."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import time
+
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Sequence
+
+import pytorch_lightning as pl
+import torch
+from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.plugins import DDPPlugin
+from torch.utils.data import DataLoader
+
+from main import PLDataLoader
+from structured_retrieval import DdpStaticGraphCallback
+from structured_retrieval_factorized import StructuredFactorizedPLModel
+
+from .io import atomic_write_json
+from .permutations import (
+    ExactDistributedEvalSampler,
+    FixedEpochDistributedSampler,
+    IndexedDataset,
+    IndexedSubsetDataset,
+    load_permutation_manifest,
+    process_rank,
+)
+
+
+class StyleShapesDataModule(PLDataLoader):
+    def __init__(
+        self,
+        args,
+        tokenizer,
+        permutation_path: str,
+        eligible_source_rows: Optional[Sequence[int]] = None,
+        fixed_candidate_runtime: Any = None,
+    ):
+        super().__init__(args, tokenizer)
+        self.permutation_path = str(permutation_path)
+        self.eligible_source_rows = (
+            None
+            if eligible_source_rows is None
+            else [int(value) for value in eligible_source_rows]
+        )
+        self.fixed_candidate_runtime = fixed_candidate_runtime
+        self.permutation_manifest = None
+        self._style_shapes_train_dataloader = None
+
+    def setup(self, stage: Optional[str] = None):
+        super().setup(stage)
+        if stage in {"fit", None}:
+            if self.eligible_source_rows is not None:
+                if not isinstance(self.train_dataset, IndexedSubsetDataset):
+                    self.train_dataset = IndexedSubsetDataset(
+                        self.train_dataset, self.eligible_source_rows
+                    )
+            elif not isinstance(self.train_dataset, IndexedDataset):
+                self.train_dataset = IndexedDataset(self.train_dataset)
+            self.permutation_manifest = load_permutation_manifest(
+                self.permutation_path, len(self.train_dataset)
+            )
+            self._style_shapes_train_dataloader = None
+
+    def collate_fn(self, batch):
+        value = super().collate_fn(batch)
+        if "_style_shapes_source_row" in batch[0]:
+            rows = [int(item["_style_shapes_source_row"]) for item in batch]
+            value["source_rows"] = rows
+            if self.fixed_candidate_runtime is not None:
+                candidates, gray_mask = self.fixed_candidate_runtime.for_source_rows(
+                    rows
+                )
+                positives = [int(item) for item in value["img_ids"]]
+                if [int(row[0]) for row in candidates] != positives:
+                    raise RuntimeError(
+                        "fixed candidate source rows are not aligned with training gold IDs"
+                    )
+                value["train_candidate_ids"] = candidates
+                value["train_candidate_gray_mask"] = gray_mask
+        return value
+
+    def train_dataloader(self):
+        if self.permutation_manifest is None:
+            raise RuntimeError("StyleShapesDataModule.setup('fit') must run first")
+        if self._style_shapes_train_dataloader is not None:
+            return self._style_shapes_train_dataloader
+        world_size = int(self.permutation_manifest["world_size"])
+        sampler = FixedEpochDistributedSampler(
+            self.train_dataset,
+            self.permutation_manifest,
+            process_rank(world_size),
+        )
+        self._style_shapes_train_dataloader = DataLoader(
+            self.train_dataset,
+            batch_size=self.train_batch_size,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+            sampler=sampler,
+            shuffle=False,
+            collate_fn=self.collate_fn,
+        )
+        return self._style_shapes_train_dataloader
+
+    def _style_shapes_eval_dataloader(self, dataset):
+        world_size = int(self.permutation_manifest["world_size"])
+        sampler = None
+        if world_size > 1:
+            sampler = ExactDistributedEvalSampler(
+                dataset,
+                world_size=world_size,
+                rank=process_rank(world_size),
+            )
+        return DataLoader(
+            dataset,
+            batch_size=self.valtest_batch_size,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+            sampler=sampler,
+            shuffle=False,
+            collate_fn=self.collate_fn,
+        )
+
+    def val_dataloader(self):
+        if self.permutation_manifest is None:
+            raise RuntimeError("StyleShapesDataModule.setup('fit') must run first")
+        if getattr(self, "_per_epoch_dual_val_loaders", False):
+            return [
+                self._style_shapes_eval_dataloader(self.val_dataset_r10),
+                self._style_shapes_eval_dataloader(self.val_dataset_r20),
+            ]
+        if self.args.val_data_path:
+            return self._style_shapes_eval_dataloader(self.val_dataset)
+        return None
+
+
+def _sharded_training_steps(num_batches, max_epochs, accumulate_grad_batches=1, limit_train_batches=1.0):
+    """Optimizer steps when the DataLoader sampler is already rank-sharded."""
+    batches = int(num_batches)
+    if isinstance(limit_train_batches, int):
+        batches = min(batches, int(limit_train_batches))
+    else:
+        batches = int(float(limit_train_batches) * batches)
+    accumulation = max(1, int(accumulate_grad_batches))
+    per_epoch = int(math.ceil(max(0, batches) / float(accumulation)))
+    return max(1, per_epoch * int(max_epochs))
+
+
+def _install_negative_trace_hook(owner, factorized_model):
+    """Capture the exact negatives returned by the inner factorized scorer."""
+    original = factorized_model._resolve_prototype_aware_negatives
+
+    def traced(*args, **kwargs):
+        value = original(*args, **kwargs)
+        owner._style_shapes_last_negatives = (list(value[0]), list(value[1]))
+        owner._style_shapes_last_negative_meta = dict(value[2])
+        return value
+
+    factorized_model._resolve_prototype_aware_negatives = traced
+
+
+class StyleShapesPLModel(StructuredFactorizedPLModel):
+    """Opt-in instrumentation; the scoring and loss implementation stay inherited."""
+
+    def __init__(
+        self,
+        args,
+        membership_hash: str,
+        trace_dir: str = "",
+        per_query_dir: str = "",
+        negative_sampler: Any = None,
+        fixed_candidate_runtime: Any = None,
+    ):
+        self.style_shapes_membership_hash = str(membership_hash)
+        self.style_shapes_trace_dir = str(trace_dir or "")
+        self.style_shapes_per_query_dir = str(per_query_dir or "")
+        if fixed_candidate_runtime is not None:
+            self.style_shapes_negative_policy = str(fixed_candidate_runtime.policy)
+        else:
+            self.style_shapes_negative_policy = str(
+                getattr(negative_sampler, "policy", "prototype_cross_plus_same")
+            )
+        self.style_shapes_neighbor_trace_field = str(
+            getattr(negative_sampler, "neighbor_trace_field", "")
+        )
+        self._style_shapes_last_negatives = None
+        self._style_shapes_last_negative_meta = None
+        self._style_shapes_trace_handle = None
+        self._style_shapes_trace_partial = None
+        self._style_shapes_trace_final = None
+        self._style_shapes_query_scores = []
+        self._style_shapes_latency_ms = []
+        self._style_shapes_refresh_ms = []
+        self._style_shapes_num_training_steps = None
+        self._style_shapes_last_train_debug = None
+        super().__init__(args)
+        original_factorization = self.model._compute_bank_factorization
+
+        def timed_factorization(device):
+            sample = len(self._style_shapes_refresh_ms) < 32
+            if sample and torch.device(device).type == "cuda":
+                torch.cuda.synchronize(device)
+            started = time.perf_counter() if sample else None
+            value = original_factorization(device)
+            if sample:
+                if torch.device(device).type == "cuda":
+                    torch.cuda.synchronize(device)
+                self._style_shapes_refresh_ms.append((time.perf_counter() - started) * 1000.0)
+            return value
+
+        self.model._compute_bank_factorization = timed_factorization
+        if negative_sampler is not None:
+            negative_sampler.install(self.model)
+        _install_negative_trace_hook(self, self.model)
+
+    def run_train_batch(self, batch: Dict[str, Any]):
+        output = super().run_train_batch(batch)
+        self._style_shapes_last_train_debug = output.debug_info
+        return output
+
+
+    @property
+    def num_training_steps(self):
+        trainer = self.trainer
+        if trainer.max_steps is not None and trainer.max_steps > 0:
+            return int(trainer.max_steps)
+        if self._style_shapes_num_training_steps is not None:
+            return int(self._style_shapes_num_training_steps)
+        datamodule = getattr(trainer, "datamodule", None)
+        if datamodule is None:
+            return super().num_training_steps
+        try:
+            batches = len(datamodule.train_dataloader())
+        except Exception:
+            return super().num_training_steps
+        self._style_shapes_num_training_steps = _sharded_training_steps(
+            batches,
+            trainer.max_epochs,
+            trainer.accumulate_grad_batches,
+            trainer.limit_train_batches,
+        )
+        return int(self._style_shapes_num_training_steps)
+
+    def on_train_start(self):
+        result = super().on_train_start()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        if self.style_shapes_trace_dir:
+            rank = int(getattr(self, "global_rank", 0))
+            target = Path(self.style_shapes_trace_dir)
+            target.mkdir(parents=True, exist_ok=True)
+            self._style_shapes_trace_partial = target / ("rank_%02d.jsonl.partial" % rank)
+            self._style_shapes_trace_final = target / ("rank_%02d.jsonl" % rank)
+            if self._style_shapes_trace_final.exists():
+                raise RuntimeError("refusing to overwrite completed trace: %s" % self._style_shapes_trace_final)
+            self._style_shapes_trace_handle = self._style_shapes_trace_partial.open(
+                "w", encoding="utf-8"
+            )
+        return result
+
+    def training_step(self, batch: Dict[str, Any], batch_idx: int):
+        loss = super().training_step(batch, batch_idx)
+        if self._style_shapes_trace_handle is not None:
+            if "train_candidate_ids" in batch:
+                debug = self._style_shapes_last_train_debug
+                if not isinstance(debug, dict):
+                    raise RuntimeError("listwise training did not expose score trace data")
+                rows = batch["source_rows"]
+                positives = batch["img_ids"]
+                candidates = debug["candidate_ids"].detach().cpu().tolist()
+                gray_masks = debug["gray_mask"].detach().cpu().tolist()
+                base_scores = debug["base_scores"].detach().float().cpu().tolist()
+                expression_scores = (
+                    debug["expression_scores"].detach().float().cpu().tolist()
+                )
+                group_scores = (
+                    debug["group_scores"].detach().float().cpu().tolist()
+                )
+                final_scores = debug["final_scores"].detach().float().cpu().tolist()
+                hardest_indices = (
+                    debug["hardest_expression_indices"].detach().cpu().tolist()
+                )
+                hardest_ids = (
+                    debug["hardest_expression_ids"].detach().cpu().tolist()
+                )
+                if not (
+                    len(rows)
+                    == len(positives)
+                    == len(candidates)
+                    == len(gray_masks)
+                    == len(base_scores)
+                    == len(expression_scores)
+                    == len(group_scores)
+                    == len(final_scores)
+                    == len(hardest_indices)
+                    == len(hardest_ids)
+                ):
+                    raise RuntimeError("fixed listwise trace fields are not aligned")
+                for index, source_row in enumerate(rows):
+                    record = {
+                        "epoch": int(self.current_epoch),
+                        "global_step": int(self.global_step),
+                        "rank": int(getattr(self, "global_rank", 0)),
+                        "source_row": int(source_row),
+                        "positive": int(positives[index]),
+                        "negative_policy": self.style_shapes_negative_policy,
+                        "candidate_ids": [int(item) for item in candidates[index]],
+                        "gray_mask": [bool(item) for item in gray_masks[index]],
+                        "base_scores": [float(item) for item in base_scores[index]],
+                        "expression_scores": [
+                            float(item) for item in expression_scores[index]
+                        ],
+                        "group_scores": [float(item) for item in group_scores[index]],
+                        "final_scores": [float(item) for item in final_scores[index]],
+                        "hardest_expression_index": int(hardest_indices[index]),
+                        "hardest_expression_id": int(hardest_ids[index]),
+                        "candidate_forward_chunk_size": int(
+                            debug["candidate_forward_chunk_size"]
+                        ),
+                        "membership_hash": self.style_shapes_membership_hash,
+                    }
+                    self._style_shapes_trace_handle.write(
+                        json.dumps(record, sort_keys=True, separators=(",", ":"))
+                        + "\n"
+                    )
+                return loss
+            if self._style_shapes_last_negatives is None:
+                raise RuntimeError("negative resolver did not expose the actual sampled negatives")
+            cross, same = self._style_shapes_last_negatives
+            rows = batch["source_rows"]
+            positives = batch["img_ids"]
+            fallbacks = batch["neg_img_ids"]
+            if not (len(rows) == len(positives) == len(fallbacks) == len(cross) == len(same)):
+                raise RuntimeError("negative trace batch fields are not aligned")
+            for source_row, positive, fallback, cross_id, same_id in zip(
+                rows, positives, fallbacks, cross, same
+            ):
+                record = {
+                    "epoch": int(self.current_epoch),
+                    "global_step": int(self.global_step),
+                    "rank": int(getattr(self, "global_rank", 0)),
+                    "source_row": int(source_row),
+                    "positive": int(positive),
+                    "fallback": int(fallback),
+                    "cross": int(cross_id),
+                    "same": int(same_id),
+                    "membership_hash": self.style_shapes_membership_hash,
+                }
+                if self.style_shapes_negative_policy != "prototype_cross_plus_same":
+                    record.update(
+                        {
+                            "negative_policy": self.style_shapes_negative_policy,
+                            "group_top32": int(cross_id),
+                            "same_pack": int(same_id),
+                            "fallback_used": False,
+                        }
+                    )
+                    if self.style_shapes_neighbor_trace_field:
+                        record[self.style_shapes_neighbor_trace_field] = int(cross_id)
+                self._style_shapes_trace_handle.write(
+                    json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+                )
+        return loss
+
+    def on_train_epoch_end(self):
+        if self._style_shapes_trace_handle is not None:
+            self._style_shapes_trace_handle.flush()
+            os.fsync(self._style_shapes_trace_handle.fileno())
+        parent = getattr(super(), "on_train_epoch_end", None)
+        return parent() if parent is not None else None
+
+    def on_train_end(self):
+        if self._style_shapes_trace_handle is not None:
+            self._style_shapes_trace_handle.flush()
+            os.fsync(self._style_shapes_trace_handle.fileno())
+            self._style_shapes_trace_handle.close()
+            os.replace(self._style_shapes_trace_partial, self._style_shapes_trace_final)
+            self._style_shapes_trace_handle = None
+        if self.style_shapes_trace_dir:
+            values = sorted(self._style_shapes_refresh_ms)
+            p95 = values[min(len(values) - 1, int(0.95 * len(values)))] if values else None
+            atomic_write_json(
+                Path(self.style_shapes_trace_dir) / ("rank_%02d_performance.json" % int(getattr(self, "global_rank", 0))),
+                {
+                    "membership_hash": self.style_shapes_membership_hash,
+                    "negative_policy": self.style_shapes_negative_policy,
+                    "refresh_cost_sample_count": len(values),
+                    "refresh_cost_mean_ms": sum(values) / len(values) if values else None,
+                    "refresh_cost_p95_ms": p95,
+                    "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
+                    "parameters_total": sum(parameter.numel() for parameter in self.parameters()),
+                    "parameters_trainable": sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad),
+                },
+            )
+        parent = getattr(super(), "on_train_end", None)
+        return parent() if parent is not None else None
+
+    def run_eval_batch(self, batch, return_debug=False, score_breakdown=False):
+        capture = bool(self.style_shapes_per_query_dir)
+        if capture and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        started = time.perf_counter() if capture else None
+        output = super().run_eval_batch(
+            batch,
+            return_debug=return_debug or capture,
+            score_breakdown=score_breakdown or capture,
+        )
+        if capture:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._style_shapes_latency_ms.append((time.perf_counter() - started) * 1000.0)
+            scores, labels, candidates, debug = output
+            ordered = [int(item) for item in debug["candidate_ids_ordered"]]
+            final = [float(item) for item in debug["final_score_per_cand"]]
+            order = sorted(range(len(final)), key=lambda index: (-final[index], ordered[index]))
+            gold = int(labels.item())
+            self._style_shapes_query_scores.append(
+                {
+                    "query_index": len(self._style_shapes_query_scores),
+                    "candidate_ids": ordered,
+                    "gray_mask": [
+                        bool(item)
+                        for item in debug.get(
+                            "gray_mask", [item == -1 for item in ordered]
+                        )
+                    ],
+                    "gold": gold,
+                    "positive_index": ordered.index(gold),
+                    "base_scores": [float(item) for item in debug["mmbert_score_per_cand"]],
+                    "instance_scores": [float(item) for item in debug["expr_score_per_cand"]],
+                    "group_scores": [float(item) for item in debug["graph_score_per_cand"]],
+                    "final_scores": final,
+                    "rank": order.index(ordered.index(gold)) + 1,
+                    "membership_hash": self.style_shapes_membership_hash,
+                }
+            )
+            if not return_debug and not score_breakdown:
+                return scores, labels, candidates
+        return output
+
+    def on_test_epoch_start(self):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        return super().on_test_epoch_start()
+
+    def on_test_epoch_end(self):
+        if self.style_shapes_per_query_dir and self._style_shapes_query_scores:
+            rank = int(getattr(self, "global_rank", 0))
+            path = Path(self.style_shapes_per_query_dir) / ("rank_%02d_scores.json" % rank)
+            atomic_write_json(path, self._style_shapes_query_scores)
+            ranks = [
+                int(item["rank"]) for item in self._style_shapes_query_scores
+            ]
+            query_count = len(ranks)
+            mrr = sum(1.0 / float(rank_value) for rank_value in ranks) / float(
+                query_count
+            )
+            atomic_write_json(
+                Path(self.style_shapes_per_query_dir)
+                / ("rank_%02d_metrics.json" % rank),
+                {
+                    "queries": query_count,
+                    "r_at_1": sum(value <= 1 for value in ranks)
+                    / float(query_count),
+                    "r_at_2": sum(value <= 2 for value in ranks)
+                    / float(query_count),
+                    "r_at_5": sum(value <= 5 for value in ranks)
+                    / float(query_count),
+                    "r_at_10": sum(value <= 10 for value in ranks)
+                    / float(query_count),
+                    "mrr": mrr,
+                    "map": mrr,
+                    "map_equals_mrr": True,
+                    "single_positive_protocol": True,
+                    "membership_hash": self.style_shapes_membership_hash,
+                },
+            )
+            values = sorted(self._style_shapes_latency_ms)
+            p95 = values[min(len(values) - 1, int(0.95 * len(values)))] if values else None
+            atomic_write_json(
+                Path(self.style_shapes_per_query_dir) / ("rank_%02d_performance.json" % rank),
+                {
+                    "queries": len(values),
+                    "latency_mean_ms": sum(values) / len(values) if values else None,
+                    "latency_p95_ms": p95,
+                    "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
+                    "factorization_cost_sample_ms": self._style_shapes_refresh_ms,
+                    "parameters_total": sum(parameter.numel() for parameter in self.parameters()),
+                    "parameters_trainable": sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad),
+                    "membership_hash": self.style_shapes_membership_hash,
+                },
+            )
+        return super().on_test_epoch_end()
+
+
+def build_final_only_trainer(args, for_train: bool) -> pl.Trainer:
+    kwargs: Dict[str, Any] = {
+        "gpus": args.gpus,
+        "max_epochs": args.epochs,
+        "accumulate_grad_batches": args.gradient_accumulation_steps,
+        "default_root_dir": args.pl_root_dir,
+        "precision": int(getattr(args, "trainer_precision", 32) or 32),
+        "replace_sampler_ddp": False,
+    }
+    callbacks: list = []
+    if (
+        for_train
+        and args.gpus
+        and args.gpus > 1
+        and getattr(args, "ddp_static_graph_callback", False)
+        and getattr(args, "bert_gradient_checkpointing", True)
+    ):
+        callbacks.append(DdpStaticGraphCallback())
+    if callbacks:
+        kwargs["callbacks"] = callbacks
+    if for_train:
+        kwargs["checkpoint_callback"] = False
+    if args.gpus and args.gpus > 1:
+        kwargs["accelerator"] = "ddp"
+        unused = getattr(args, "ddp_find_unused_parameters", None)
+        if unused is not None:
+            kwargs["plugins"] = DDPPlugin(find_unused_parameters=unused)
+    return pl.Trainer(**kwargs)

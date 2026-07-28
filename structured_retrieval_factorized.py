@@ -47,6 +47,40 @@ from structured_retrieval_tokens import (
     _extract_yaml_config_paths,
     load_structured_token_yaml_with_extends,
 )
+from style_shapes.fixed_same_pack import (
+    GRAY_SENTINEL_ID,
+    flatten_query_major,
+    hardest_expression_rank_loss,
+    listwise_match_loss,
+)
+
+
+def _fixed_listwise_log_preview(
+    debug_info: Dict[str, Any],
+    max_candidate_rows: int = 2,
+    max_hardest_ids: int = 8,
+) -> Optional[Tuple[List[List[int]], List[int]]]:
+    """Return compact fixed-listwise previews without legacy triplet fields."""
+    if debug_info.get("negative_policy") != "fixed_same_pack_listwise":
+        return None
+    candidate_ids = debug_info.get("candidate_ids")
+    hardest_ids = debug_info.get("hardest_expression_ids")
+    if not isinstance(candidate_ids, torch.Tensor) or candidate_ids.ndim != 2:
+        raise RuntimeError(
+            "fixed_same_pack_listwise debug info requires candidate_ids with shape [B,N]"
+        )
+    if not isinstance(hardest_ids, torch.Tensor) or hardest_ids.ndim != 1:
+        raise RuntimeError(
+            "fixed_same_pack_listwise debug info requires hardest_expression_ids with shape [B]"
+        )
+    candidates = (
+        candidate_ids[: int(max_candidate_rows)].detach().cpu().tolist()
+    )
+    hardest = hardest_ids[: int(max_hardest_ids)].detach().cpu().tolist()
+    return (
+        [[int(item) for item in row] for row in candidates],
+        [int(item) for item in hardest],
+    )
 
 
 @dataclass
@@ -88,6 +122,14 @@ class StructuredFactorizedArguments(StructuredArguments):
     factorized_train_mmbert_two_way: Optional[bool] = field(default=False)
     # Which negative is scored against pos when two_way: "same" (same-proto neg) or "cross" (cross-proto neg).
     factorized_train_two_way_neg: Optional[str] = field(default="same")
+    # Opt-in Style Shapes protocol. The legacy positive/cross/same path remains the default.
+    factorized_train_mode: Optional[str] = field(default="legacy_triplet")
+    factorized_train_candidate_count: Optional[int] = field(default=10)
+    # Number of candidates per query sent through one vectorized MM-BERT call.
+    # 10 means a batch of B queries becomes one query-major batch of B*10 pairs.
+    factorized_candidate_forward_chunk_size: Optional[int] = field(default=10)
+    factorized_gray_embedding_path: Optional[str] = field(default="")
+    factorized_gray_sentinel_id: Optional[int] = field(default=-1)
     factorized_variant: Optional[str] = field(default="minimal")
 
     lambda_style_proto: Optional[float] = field(default=0.4)
@@ -144,6 +186,29 @@ class StructuredFactorizedArguments(StructuredArguments):
         if tw not in {"same", "cross"}:
             raise ValueError("factorized_train_two_way_neg must be 'same' or 'cross'.")
         self.factorized_train_two_way_neg = tw
+        train_mode = str(self.factorized_train_mode or "legacy_triplet").strip().lower()
+        if train_mode not in {"legacy_triplet", "fixed_same_pack_listwise"}:
+            raise ValueError(
+                "factorized_train_mode must be 'legacy_triplet' or "
+                "'fixed_same_pack_listwise'."
+            )
+        self.factorized_train_mode = train_mode
+        if int(self.factorized_train_candidate_count or 0) < 2:
+            raise ValueError("factorized_train_candidate_count must be >= 2.")
+        if int(self.factorized_candidate_forward_chunk_size or 0) <= 0:
+            raise ValueError("factorized_candidate_forward_chunk_size must be > 0.")
+        if int(self.factorized_gray_sentinel_id) != -1:
+            raise ValueError("factorized_gray_sentinel_id is frozen to -1.")
+        if train_mode == "fixed_same_pack_listwise":
+            if int(self.factorized_train_candidate_count) != 10:
+                raise ValueError("fixed_same_pack_listwise requires exactly 10 candidates.")
+            if bool(self.factorized_train_mmbert_two_way):
+                raise ValueError("fixed_same_pack_listwise is incompatible with two-way training.")
+            if int(self.factorized_candidate_forward_chunk_size) > 10:
+                raise ValueError(
+                    "factorized_candidate_forward_chunk_size cannot exceed 10 "
+                    "for fixed_same_pack_listwise."
+                )
         variant = str(self.factorized_variant or "minimal").strip().lower()
         if variant not in {"minimal", "full"}:
             raise ValueError("factorized_variant must be 'minimal' or 'full'.")
@@ -409,6 +474,28 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         self._train_bank_factorization_step: Optional[int] = None
         self._proto_reduce_cache_by_device: Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._sticker_to_proto_cpu = self._build_sticker_to_proto_cpu()
+        self._gray_candidate_embedding_cpu: Optional[torch.Tensor] = None
+        gray_path = str(getattr(args, "factorized_gray_embedding_path", "") or "").strip()
+        if gray_path:
+            if not os.path.exists(gray_path):
+                raise FileNotFoundError(
+                    "configured gray candidate embedding does not exist: %s" % gray_path
+                )
+            gray_payload = torch.load(gray_path, map_location="cpu")
+            if isinstance(gray_payload, dict):
+                gray_payload = gray_payload.get("embedding")
+            if not isinstance(gray_payload, torch.Tensor):
+                raise ValueError("gray candidate embedding file has no tensor")
+            gray_tensor = gray_payload.detach().cpu().float().reshape(-1)
+            if (
+                int(gray_tensor.numel()) != int(self.visual_feat_dim)
+                or not torch.isfinite(gray_tensor).all()
+            ):
+                raise ValueError(
+                    "gray candidate embedding must be finite with shape [%d]"
+                    % int(self.visual_feat_dim)
+                )
+            self._gray_candidate_embedding_cpu = gray_tensor
         self._train_profile_sums: Optional[Dict[str, float]] = None
         self._train_profile_count: int = 0
 
@@ -521,6 +608,47 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         mapping = self._sticker_to_proto_cpu.to(device)
         self._sticker_to_proto_by_device[cache_key] = mapping
         return mapping
+
+    def _candidate_embeddings_from_bank(
+        self,
+        bank_h: torch.Tensor,
+        candidate_ids: Sequence[int],
+    ) -> torch.Tensor:
+        """Index real stickers safely and substitute the frozen gray embedding for -1."""
+        ids = [int(item) for item in candidate_ids]
+        invalid = [
+            item
+            for item in ids
+            if item != GRAY_SENTINEL_ID
+            and (item < 0 or item >= int(bank_h.size(0)))
+        ]
+        if invalid:
+            raise IndexError("candidate sticker ID outside the bank: %s" % invalid[:8])
+        safe = torch.tensor(
+            [0 if item == GRAY_SENTINEL_ID else item for item in ids],
+            dtype=torch.long,
+            device=bank_h.device,
+        )
+        result = bank_h.index_select(0, safe)
+        gray_positions = [
+            index for index, item in enumerate(ids) if item == GRAY_SENTINEL_ID
+        ]
+        if gray_positions:
+            if self._gray_candidate_embedding_cpu is None:
+                raise RuntimeError(
+                    "gray sentinel candidates require factorized_gray_embedding_path"
+                )
+            gray = self._gray_candidate_embedding_cpu.to(
+                device=result.device, dtype=result.dtype
+            )
+            gray_index = torch.tensor(
+                gray_positions, dtype=torch.long, device=result.device
+            )
+            result = result.clone()
+            result.index_copy_(
+                0, gray_index, gray.unsqueeze(0).expand(len(gray_positions), -1)
+            )
+        return result
 
     def _get_proto_reduce_tensors(
         self, device: torch.device
@@ -686,13 +814,32 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         proto_density: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sticker_to_proto = self._get_sticker_to_proto(proto_logits.device)
-        sticker_idx = torch.tensor(list(sticker_ids), dtype=torch.long, device=proto_logits.device)
+        ids = [int(item) for item in sticker_ids]
+        invalid = [
+            item
+            for item in ids
+            if item != GRAY_SENTINEL_ID
+            and (item < 0 or item >= int(sticker_to_proto.numel()))
+        ]
+        if invalid:
+            raise IndexError("sticker ID outside prototype mapping: %s" % invalid[:8])
+        valid_mask = torch.tensor(
+            [item != GRAY_SENTINEL_ID for item in ids],
+            dtype=torch.bool,
+            device=proto_logits.device,
+        )
+        sticker_idx = torch.tensor(
+            [0 if item == GRAY_SENTINEL_ID else item for item in ids],
+            dtype=torch.long,
+            device=proto_logits.device,
+        )
         proto_ids = sticker_to_proto.index_select(0, sticker_idx)
-        return self.prototype_reasoner.gather_proto_scores(
+        scores = self.prototype_reasoner.gather_proto_scores(
             proto_logits=proto_logits,
             proto_ids=proto_ids,
             proto_density=proto_density,
         )
+        return scores.masked_fill(~valid_mask, 0.0)
 
     def _gather_proto_scores_for_candidates(
         self,
@@ -701,13 +848,32 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         proto_density: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         sticker_to_proto = self._get_sticker_to_proto(proto_logit_row.device)
-        sticker_idx = torch.tensor(list(candidate_ids), dtype=torch.long, device=proto_logit_row.device)
+        ids = [int(item) for item in candidate_ids]
+        invalid = [
+            item
+            for item in ids
+            if item != GRAY_SENTINEL_ID
+            and (item < 0 or item >= int(sticker_to_proto.numel()))
+        ]
+        if invalid:
+            raise IndexError("candidate ID outside prototype mapping: %s" % invalid[:8])
+        valid_mask = torch.tensor(
+            [item != GRAY_SENTINEL_ID for item in ids],
+            dtype=torch.bool,
+            device=proto_logit_row.device,
+        )
+        sticker_idx = torch.tensor(
+            [0 if item == GRAY_SENTINEL_ID else item for item in ids],
+            dtype=torch.long,
+            device=proto_logit_row.device,
+        )
         proto_ids = sticker_to_proto.index_select(0, sticker_idx)
-        return self.prototype_reasoner.gather_proto_scores(
+        scores = self.prototype_reasoner.gather_proto_scores(
             proto_logits=proto_logit_row,
             proto_ids=proto_ids,
             proto_density=proto_density,
         )
+        return scores.masked_fill(~valid_mask, 0.0)
 
     def _compute_final_score(
         self,
@@ -1001,6 +1167,195 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         )
         base = self.compute_base_score(logits)
         return base[:b], base[b:]
+
+    def forward_train_listwise_batch(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        img_ids: Sequence[int],
+        candidate_ids: Sequence[Sequence[int]],
+        gray_mask: Optional[Sequence[Sequence[bool]]] = None,
+        global_step: int = 0,
+        total_steps: Optional[int] = None,
+    ) -> StructuredFactorizedForwardOutput:
+        """Vectorized gold + nine fixed same-pack candidate training."""
+        if self.uses_full_variant():
+            raise RuntimeError(
+                "fixed_same_pack_listwise is registered only for the v6 minimal core"
+            )
+        device = input_ids.device
+        batch_size = int(input_ids.size(0))
+        expected_count = int(self.args.factorized_train_candidate_count)
+        candidate_tensor = torch.tensor(
+            candidate_ids, dtype=torch.long, device=device
+        )
+        if tuple(candidate_tensor.shape) != (batch_size, expected_count):
+            raise ValueError(
+                "fixed candidates must have shape [%d,%d], got %s"
+                % (batch_size, expected_count, tuple(candidate_tensor.shape))
+            )
+        positives = torch.tensor(
+            [int(item) for item in img_ids], dtype=torch.long, device=device
+        )
+        if not torch.equal(candidate_tensor[:, 0], positives):
+            raise ValueError("fixed candidate 0 must match every training gold")
+        computed_gray = candidate_tensor.eq(GRAY_SENTINEL_ID)
+        if computed_gray[:, 0].any():
+            raise ValueError("fixed candidate gold cannot be gray")
+        if gray_mask is not None:
+            supplied_gray = torch.tensor(gray_mask, dtype=torch.bool, device=device)
+            if not torch.equal(supplied_gray, computed_gray):
+                raise ValueError("fixed candidate gray mask is not aligned")
+        for row in candidate_tensor.detach().cpu().tolist():
+            real = [int(item) for item in row if int(item) != GRAY_SENTINEL_ID]
+            if len(real) != len(set(real)):
+                raise ValueError("fixed real candidates must be unique within each row")
+
+        q_style, q_expr, style_usage_gate = self.encode_style_expr_queries(
+            input_ids, attention_mask
+        )
+        bank_all_h, _, _, proto_vectors, _ = (
+            self._get_train_or_fresh_bank_factorization(device, global_step)
+        )
+        proto_logits, _, style_proto_loss, proto_acc = self._compute_proto_supervision(
+            q_style=q_style,
+            proto_vectors=proto_vectors,
+            pos_ids=img_ids,
+            device=device,
+        )
+
+        chunk_size = min(
+            expected_count,
+            int(self.args.factorized_candidate_forward_chunk_size),
+        )
+        base_chunks: List[torch.Tensor] = []
+        expr_chunks: List[torch.Tensor] = []
+        graph_chunks: List[torch.Tensor] = []
+        final_chunks: List[torch.Tensor] = []
+        c_chunks: List[torch.Tensor] = []
+        a_chunks: List[torch.Tensor] = []
+        try:
+            for start in range(0, expected_count, chunk_size):
+                stop = min(expected_count, start + chunk_size)
+                ids_chunk = candidate_tensor[:, start:stop]
+                flat_input, flat_mask, flat_ids = flatten_query_major(
+                    input_ids, attention_mask, ids_chunk
+                )
+                flat_id_list = [int(item) for item in flat_ids.detach().cpu().tolist()]
+                candidate_h = self._candidate_embeddings_from_bank(
+                    bank_all_h, flat_id_list
+                )
+                logits = self._compute_pair_logits(
+                    input_ids=flat_input,
+                    attention_mask=flat_mask,
+                    img_ids=flat_id_list,
+                    img_emb=candidate_h,
+                )
+                mmbert = self.compute_base_score(logits)
+                _, candidate_c, candidate_a = self.decompose_sticker(candidate_h)
+                width = stop - start
+                flat_q_expr = q_expr.repeat_interleave(width, dim=0)
+                expression = self.compute_expression_compatibility(
+                    flat_q_expr, candidate_a
+                )
+                flat_proto_logits = proto_logits.repeat_interleave(width, dim=0)
+                graph = self._gather_proto_scores_for_batch(
+                    flat_proto_logits, flat_id_list
+                )
+                final = self._compute_final_score(mmbert, expression, graph)
+                base_chunks.append(mmbert.reshape(batch_size, width))
+                expr_chunks.append(expression.reshape(batch_size, width))
+                graph_chunks.append(graph.reshape(batch_size, width))
+                final_chunks.append(final.reshape(batch_size, width))
+                c_chunks.append(candidate_c.reshape(batch_size, width, -1))
+                a_chunks.append(candidate_a.reshape(batch_size, width, -1))
+        except torch.cuda.OutOfMemoryError as exc:
+            raise RuntimeError(
+                "fixed_same_pack_listwise OOM with query batch=%d and "
+                "candidate_forward_chunk_size=%d; rerun with an explicit chunk "
+                "override in the pre-registered order 5, 2, 1 before reducing "
+                "train_batch_size" % (batch_size, chunk_size)
+            ) from exc
+
+        base_scores = torch.cat(base_chunks, dim=1)
+        expression_scores = torch.cat(expr_chunks, dim=1)
+        graph_scores = torch.cat(graph_chunks, dim=1)
+        final_scores = torch.cat(final_chunks, dim=1)
+        candidate_c = torch.cat(c_chunks, dim=1)
+        candidate_a = torch.cat(a_chunks, dim=1)
+
+        match_loss = listwise_match_loss(final_scores)
+        expr_rank_loss, hardest_expression_index = hardest_expression_rank_loss(
+            expression_scores, float(self.args.expr_margin)
+        )
+        row_index = torch.arange(batch_size, dtype=torch.long, device=device)
+        hardest_expression_ids = candidate_tensor[
+            row_index, hardest_expression_index
+        ]
+        orth_loss = self.compute_orth_loss(
+            candidate_c[:, 0, :], candidate_a[:, 0, :]
+        )
+        lp = float(self.args.lambda_style_proto or 0.0) * style_proto_loss
+        le = effective_lambda_expr_rank_loss_weight(self.args) * expr_rank_loss
+        lo = float(self.args.lambda_orth or 0.0) * orth_loss
+        if self.args.base_only:
+            lp = lp * 0.0
+            le = le * 0.0
+            lo = lo * 0.0
+        total_loss = match_loss + lp + le + lo
+
+        pos_fused = final_scores[:, 0]
+        cross_fused = final_scores[:, 1]
+        same_fused = final_scores[row_index, hardest_expression_index]
+        with torch.no_grad():
+            train_scalars = torch.stack(
+                [
+                    proto_acc.reshape(()),
+                    (pos_fused - same_fused).mean().reshape(()),
+                    base_scores[:, 0].mean().reshape(()),
+                    base_scores[:, 1].mean().reshape(()),
+                    base_scores[:, -1].mean().reshape(()),
+                    expression_scores[:, 0].mean().reshape(()),
+                    expression_scores[
+                        row_index, hardest_expression_index
+                    ].mean().reshape(()),
+                ],
+                dim=0,
+            )
+        debug_info = {
+            "_train_scalars": train_scalars,
+            "negative_policy": "fixed_same_pack_listwise",
+            "candidate_ids": candidate_tensor.detach(),
+            "gray_mask": computed_gray.detach(),
+            "base_scores": base_scores.detach(),
+            "expression_scores": expression_scores.detach(),
+            "group_scores": graph_scores.detach(),
+            "final_scores": final_scores.detach(),
+            "hardest_expression_indices": hardest_expression_index.detach(),
+            "hardest_expression_ids": hardest_expression_ids.detach(),
+            "candidate_forward_chunk_size": int(chunk_size),
+        }
+        zero = candidate_c.new_zeros(())
+        one = torch.ones((), device=device, dtype=torch.float32)
+        return StructuredFactorizedForwardOutput(
+            loss=total_loss,
+            match_loss=match_loss,
+            style_proto_loss=style_proto_loss,
+            style_neighbor_loss=zero,
+            orth_loss=orth_loss,
+            expr_rank_loss=expr_rank_loss,
+            aux_warmup=one,
+            pos_fused_score=pos_fused,
+            cross_fused_score=cross_fused,
+            same_fused_score=same_fused,
+            style_usage_gate=style_usage_gate,
+            structured_scale=torch.zeros((), device=device, dtype=torch.float32),
+            expr_scale=one,
+            style_proto_scale=one,
+            training_stage="minimal_core_fixed_same_pack_listwise",
+            model_variant=str(self.args.factorized_variant),
+            debug_info=debug_info,
+        )
 
     def forward_train_batch(
         self,
@@ -1381,6 +1736,7 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         img_ids: Sequence[int],
         cands: Optional[Sequence[Sequence[int]]] = None,
         return_debug: bool = False,
+        score_breakdown: bool = False,
     ):
         device = input_ids.device
         batch_size = input_ids.size(0)
@@ -1399,10 +1755,18 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
         use_cands = nonempty_batch_cands(cands)
         if use_cands:
             candidate_ids = [int(x) for x in cands[0]]
-            candidate_idx = torch.tensor(candidate_ids, dtype=torch.long, device=device)
-            candidate_h = bank_all_h.index_select(0, candidate_idx)
-            candidate_c = style_bank_c.index_select(0, candidate_idx)
-            candidate_a = style_bank_a.index_select(0, candidate_idx)
+            if GRAY_SENTINEL_ID in candidate_ids:
+                candidate_h = self._candidate_embeddings_from_bank(
+                    bank_all_h, candidate_ids
+                )
+                _, candidate_c, candidate_a = self.decompose_sticker(candidate_h)
+            else:
+                candidate_idx = torch.tensor(
+                    candidate_ids, dtype=torch.long, device=device
+                )
+                candidate_h = bank_all_h.index_select(0, candidate_idx)
+                candidate_c = style_bank_c.index_select(0, candidate_idx)
+                candidate_a = style_bank_a.index_select(0, candidate_idx)
         else:
             if getattr(self.args, "candidate_eval_only", False) or getattr(
                 self.args, "test_with_cand", False
@@ -1463,7 +1827,7 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
             final_score = self._compute_final_score(mmbert_score, expr_score, graph_score)
         rank_scores = final_score.unsqueeze(0)
         labels = torch.tensor(img_ids, dtype=torch.long, device=device)
-        if not return_debug:
+        if not return_debug and not score_breakdown:
             return rank_scores, labels, candidate_ids if use_cands else None
 
         if self.uses_full_variant():
@@ -1507,6 +1871,20 @@ class StructuredFactorizedStickerModel(StructuredStickerModel):
                     "s_final = s_mmbert + lambda_expr * s_expr + lambda_style_proto * proto_logit[proto_id]"
                 ),
             }
+        if score_breakdown:
+            eval_debug["candidate_ids_ordered"] = [int(x) for x in candidate_ids]
+            eval_debug["gray_mask"] = [
+                int(x) == GRAY_SENTINEL_ID for x in candidate_ids
+            ]
+            eval_debug["mmbert_score_per_cand"] = mmbert_score.detach().float().cpu().tolist()
+            eval_debug["final_score_per_cand"] = final_score.detach().float().cpu().tolist()
+            if self.uses_full_variant():
+                eval_debug["style_score_per_cand"] = style_score.detach().float().cpu().tolist()
+                eval_debug["expr_score_per_cand"] = expr_score.detach().float().cpu().tolist()
+                eval_debug["graph_score_per_cand"] = graph_score.detach().float().cpu().tolist()
+            else:
+                eval_debug["expr_score_per_cand"] = expr_score.detach().float().cpu().tolist()
+                eval_debug["graph_score_per_cand"] = graph_score.detach().float().cpu().tolist()
         return rank_scores, labels, candidate_ids if use_cands else None, eval_debug
 
 
@@ -1667,6 +2045,24 @@ class StructuredFactorizedPLModel(StructuredPLModel):
         return pl.LightningModule.on_train_start(self)
 
     def run_train_batch(self, batch: Dict[str, Any]) -> StructuredFactorizedForwardOutput:
+        if "train_candidate_ids" in batch:
+            if str(self.args.factorized_train_mode) != "fixed_same_pack_listwise":
+                raise RuntimeError(
+                    "train candidates were supplied while factorized_train_mode is legacy"
+                )
+            return self.model.forward_train_listwise_batch(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                img_ids=batch["img_ids"],
+                candidate_ids=batch["train_candidate_ids"],
+                gray_mask=batch.get("train_candidate_gray_mask"),
+                global_step=int(self.global_step),
+                total_steps=int(self.num_training_steps),
+            )
+        if str(self.args.factorized_train_mode) == "fixed_same_pack_listwise":
+            raise RuntimeError(
+                "fixed_same_pack_listwise requires frozen train candidates in every batch"
+            )
         return self.model.forward_train_batch(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
@@ -1676,13 +2072,19 @@ class StructuredFactorizedPLModel(StructuredPLModel):
             total_steps=int(self.num_training_steps),
         )
 
-    def run_eval_batch(self, batch: Dict[str, Any], return_debug: bool = False):
+    def run_eval_batch(
+        self,
+        batch: Dict[str, Any],
+        return_debug: bool = False,
+        score_breakdown: bool = False,
+    ):
         return self.model.forward_eval_batch(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
             img_ids=batch["img_ids"],
             cands=batch.get("cands"),
             return_debug=return_debug,
+            score_breakdown=score_breakdown,
         )
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
@@ -1760,16 +2162,28 @@ class StructuredFactorizedPLModel(StructuredPLModel):
                 and outputs.debug_info is not None
                 and ts_list is not None
             ):
-                logger.info(
-                    "[StructuredFactorizedTrain] step=%d proto_acc=%.4f gate=%.4f "
-                    "cross_neg=%s same_neg=%s margin=%.4f",
-                    int(self.global_step),
-                    float(ts_list[0]),
-                    float(ts_list[1]),
-                    outputs.debug_info["cross_neg_ids_preview"],
-                    outputs.debug_info["same_neg_ids_preview"],
-                    float(ts_list[2]),
-                )
+                listwise_preview = _fixed_listwise_log_preview(outputs.debug_info)
+                if listwise_preview is not None:
+                    candidate_preview, hardest_preview = listwise_preview
+                    logger.info(
+                        "[StructuredFactorizedTrainListwise] step=%d proto_acc=%.4f "
+                        "candidate_rows=%s hardest_expression_ids=%s",
+                        int(self.global_step),
+                        float(ts_list[0]),
+                        candidate_preview,
+                        hardest_preview,
+                    )
+                else:
+                    logger.info(
+                        "[StructuredFactorizedTrain] step=%d proto_acc=%.4f gate=%.4f "
+                        "cross_neg=%s same_neg=%s margin=%.4f",
+                        int(self.global_step),
+                        float(ts_list[0]),
+                        float(ts_list[1]),
+                        outputs.debug_info["cross_neg_ids_preview"],
+                        outputs.debug_info["same_neg_ids_preview"],
+                        float(ts_list[2]),
+                    )
                 logger.info(
                     "[StructuredFactorizedTrainStage] step=%d stage=%s struct_scale=%.3f expr_scale=%.3f proto_scale=%.3f",
                     int(self.global_step),
@@ -1827,15 +2241,29 @@ class StructuredFactorizedPLModel(StructuredPLModel):
                 and outputs.debug_info is not None
                 and ts_list is not None
             ):
-                logger.info(
-                    "[StructuredFactorizedTrain] step=%d proto_acc=%.4f margin_pos_minus_same=%.4f "
-                    "cross_neg=%s same_neg=%s",
-                    int(self.global_step),
-                    float(ts_list[0]),
-                    float(ts_list[1]),
-                    outputs.debug_info["cross_neg_ids_preview"],
-                    outputs.debug_info["same_neg_ids_preview"],
-                )
+                listwise_preview = _fixed_listwise_log_preview(outputs.debug_info)
+                if listwise_preview is not None:
+                    candidate_preview, hardest_preview = listwise_preview
+                    logger.info(
+                        "[StructuredFactorizedTrainListwise] step=%d proto_acc=%.4f "
+                        "margin_pos_minus_hardest_expression=%.4f "
+                        "candidate_rows=%s hardest_expression_ids=%s",
+                        int(self.global_step),
+                        float(ts_list[0]),
+                        float(ts_list[1]),
+                        candidate_preview,
+                        hardest_preview,
+                    )
+                else:
+                    logger.info(
+                        "[StructuredFactorizedTrain] step=%d proto_acc=%.4f "
+                        "margin_pos_minus_same=%.4f cross_neg=%s same_neg=%s",
+                        int(self.global_step),
+                        float(ts_list[0]),
+                        float(ts_list[1]),
+                        outputs.debug_info["cross_neg_ids_preview"],
+                        outputs.debug_info["same_neg_ids_preview"],
+                    )
 
         return outputs.loss
 

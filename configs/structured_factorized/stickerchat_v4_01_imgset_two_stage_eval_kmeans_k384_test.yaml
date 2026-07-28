@@ -1,0 +1,17 @@
+# v4_01 (full / two-stage) checkpoint: run K-means split *test JSONs* under processed_style_kmeans_k384/.
+#
+# Important: this run was trained on stickerchat/processed/ style bank (see train log). For a valid
+# load, factorized_bank / style_neighbors / sticker_metadata stay on ./stickerchat/processed/.
+# Only the test (and optional train path for logging consistency) switch to the K-means release files.
+extends: stickerchat_v4_01_imgset_two_stage.yaml
+
+name: stickerchat_v4_01_imgset_two_stage_eval_kmeans_k384_test
+description: >
+  stickerchat_v4_01_imgset_two_stage with test R10/R20 JSONs from processed_style_kmeans_k384;
+  style bank and neighbors remain stickerchat/processed/ to match the trained checkpoint.
+
+pl_root_dir: logs/stickerchat_factorized_v4_01_kmeans_k384_test_eval
+
+per_epoch_eval_test_r10_path: ./stickerchat/processed_style_kmeans_k384/release_test_u_sticker_format_int_with_cand_r10.json
+per_epoch_eval_test_r20_path: ./stickerchat/processed_style_kmeans_k384/release_test_u_sticker_format_int_with_cand_r20.json
+test_data_path: ./stickerchat/processed_style_kmeans_k384/release_test_u_sticker_format_int_with_cand_r10.json

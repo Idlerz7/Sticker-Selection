@@ -1,0 +1,45 @@
+experiment: vpd_pack_relative_setwise_r10
+dataset: stickerchat
+group_source: vpd_pack
+num_groups: 384
+conda_env: stickr-select
+mode: train
+
+base_config: configs/structured_factorized/stickerchat_v6_minimal_core.yaml
+group_bank: artifacts/style_shapes/groups/stickerchat/vpd_pack/group_bank.json
+sticker_metadata_path: stickerchat/processed/sticker_metadata.json
+final_clip_descriptor: artifacts/lvpcm/descriptors/stickerchat/final_clip_clean.pt
+vpd_descriptor: artifacts/lvpcm/descriptors/stickerchat/multi_clean.pt
+pack_residual_bundle: artifacts/vigem/residuals/stickerchat_pack_relative.pt
+parent_vigem_init_checkpoint_path: artifacts/vigem/init/stickerchat_vpd_pack_seed2021.ckpt
+init_checkpoint_path: artifacts/vigem/init/stickerchat_pack_relative_setwise_seed2021.ckpt
+permutation_manifest: artifacts/style_shapes/permutations/stickerchat_seed2021_ws8.json
+output_dir: artifacts/vigem/pilot/stickerchat/vpd_pack_relative_setwise_r10
+
+instance_score_weight: 0.3
+instance_loss_weight: 0.3
+group_gradient_policy: detach_shared_bert
+bootstrap_iterations: 10000
+bootstrap_seed: 2021
+baseline_scores_path: ""
+
+fixed_candidates:
+  mode: fixed_same_pack_listwise
+  manifest_path: artifacts/style_shapes/candidates/stickerchat_fixed_same_pack_r10/manifest.json
+
+model_overrides:
+  gpus: 8
+  train_batch_size: 16
+  gradient_accumulation_steps: 1
+  train_data_path: stickerchat/processed/release_train_u_sticker_format_int.json
+  val_data_path: stickerchat/processed/release_val_u_sticker_format_int_with_cand_fixed_same_pack_r10.json
+  per_epoch_eval_test_r10_path: ""
+  per_epoch_eval_test_r20_path: ""
+  test_data_path: stickerchat/processed/release_test_u_sticker_format_int_with_cand_fixed_same_pack_r10.json
+  factorized_train_mode: fixed_same_pack_listwise
+  factorized_train_candidate_count: 10
+  factorized_candidate_forward_chunk_size: 10
+  factorized_gray_sentinel_id: -1
+  factorized_gray_embedding_path: artifacts/style_shapes/candidates/stickerchat_fixed_same_pack_r10/gray_clip_embedding.pt
+  factorized_train_bank_refresh_steps: 500
+  pl_root_dir: artifacts/vigem/pilot/stickerchat/vpd_pack_relative_setwise_r10/lightning

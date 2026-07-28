@@ -1,0 +1,20 @@
+dataset: stickerchat
+group_source: base_only_reference_sampler
+reference_bank_source: final_clip_pack_original
+num_groups: 384
+conda_env: stickr-select
+mode: train
+base_config: configs/structured_factorized/stickerchat_v6_minimal_core.yaml
+group_bank: artifacts/style_shapes/groups/stickerchat/final_clip_pack_original/group_bank.json
+init_checkpoint_path: artifacts/style_shapes/init/stickerchat_seed2021.ckpt
+permutation_manifest: artifacts/style_shapes/permutations/stickerchat_seed2021_ws8.json
+output_dir: artifacts/style_shapes/pilot/stickerchat/base_only_reference_sampler
+model_overrides:
+  gpus: 8
+  base_only: true
+  train_data_path: stickerchat/processed/release_train_u_sticker_format_int.json
+  per_epoch_eval_test_r10_path: stickerchat/processed/release_val_u_sticker_format_int_with_cand_same_pack_r10.json
+  per_epoch_eval_test_r20_path: stickerchat/processed/release_val_u_sticker_format_int_with_cand_r20.json
+  test_data_path: stickerchat/processed/release_test_u_sticker_format_int_with_cand_same_pack_r10.json
+  factorized_train_bank_refresh_steps: 500
+  pl_root_dir: artifacts/style_shapes/pilot/stickerchat/base_only_reference_sampler/lightning

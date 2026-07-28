@@ -23,12 +23,20 @@ data/*
 !data/ocr_max10.json
 u-sticker/
 stickerchat/
+external_data/
 
 # Training / evaluation outputs
 logs/
 result/
 pseudo_labels/
 style_neighbors.json
+/artifacts/
+
+# Generated analysis exports and figures
+/exports/
+/figures/
+/eigml_figures/
+/analysis_pairs_*.json
 
 # Model checkpoints and downloaded model files
 ckpt/
@@ -42,6 +50,8 @@ runs/
 # Misc local artifacts
 *.tmp
 *.swp
+*.jsonl.partial
+events.out.tfevents.*
 
 # Large archives and split volumes
 *.zip

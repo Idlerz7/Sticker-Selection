@@ -1824,6 +1824,17 @@ def load_checkpoint_to_model(
         logger.info(f"missing keys (first 20): {missing[:20]}")
     if unexpected:
         logger.info(f"unexpected keys (first 20): {unexpected[:20]}")
+    if not strict and missing:
+        bert_missing = [k for k in missing if ".bert." in k]
+        if bert_missing:
+            logger.warning(
+                "strict=False and %d parameter groups under .bert. were not in the checkpoint — "
+                "those BERT weights stay the init from config (not your trained checkpoint). "
+                "Use matching --config, or set strict_checkpoint_load=true to fail fast. "
+                "Examples: %s",
+                len(bert_missing),
+                bert_missing[:8],
+            )
 
 
 def build_trainer(args: StructuredArguments, for_train: bool) -> pl.Trainer:

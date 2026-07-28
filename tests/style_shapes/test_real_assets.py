@@ -1,0 +1,199 @@
+import json
+import os
+import unittest
+
+import torch
+
+from factorized_style_bank import FactorizedStyleBank
+from style_shapes.builders import (
+    _pack_centroids,
+    _pack_members,
+    _reference_k384_membership,
+    _sticker_assignments,
+    load_descriptor,
+)
+from style_shapes.clustering import legacy_pack_kmeans
+from style_shapes.group_bank import GroupBank
+from style_shapes.fixed_same_pack import (
+    EXPECTED_SPLIT_STATS,
+    load_fixed_same_pack_runtime,
+    validate_fixed_manifest,
+)
+from style_shapes.io import sha256_file
+from style_shapes.negative_sampling import (
+    StickerChatDualLocalNegativeSampler,
+    build_eligibility_manifest,
+    load_id_to_pack,
+    validate_eligibility_manifest,
+)
+from style_shapes.validation import candidate_file_audit
+
+
+@unittest.skipUnless(
+    os.environ.get("STYLE_SHAPES_REAL_ASSETS") == "1",
+    "set STYLE_SHAPES_REAL_ASSETS=1 for real-asset integration tests",
+)
+class RealAssetIntegrationTest(unittest.TestCase):
+    def test_descriptor_shapes_and_alignment(self):
+        contracts = (
+            ("dstc", 307),
+            ("stickerchat", 174695),
+        )
+        for dataset, rows in contracts:
+            ids, multi, _ = load_descriptor(
+                "artifacts/lvpcm/descriptors/%s/multi_clean.pt" % dataset
+            )
+            final_ids, final, _ = load_descriptor(
+                "artifacts/lvpcm/descriptors/%s/final_clip_clean.pt" % dataset
+            )
+            self.assertEqual(ids, list(range(rows)))
+            self.assertEqual(ids, final_ids)
+            self.assertEqual(list(multi.shape), [rows, 256])
+            self.assertEqual(list(final.shape), [rows, 512])
+            self.assertTrue(torch.isfinite(multi).all())
+            self.assertTrue(torch.isfinite(final).all())
+
+    def test_dstc_legacy_compact_membership_and_public_load(self):
+        legacy = FactorizedStyleBank.from_json("factorized_style_bank.json")
+        compact = FactorizedStyleBank.from_json(
+            "artifacts/style_shapes/groups/dstc/llm_original/group_bank.json"
+        )
+        legacy_partition = sorted(
+            sorted(row.member_ids) for row in legacy.prototypes
+        )
+        compact_partition = sorted(
+            sorted(row.member_ids) for row in compact.prototypes
+        )
+        self.assertEqual(legacy_partition, compact_partition)
+        self.assertEqual(len(compact.records), 307)
+        self.assertEqual(len(compact.prototypes), 85)
+
+    def test_stickerchat_reference_k384_rebuild_exact(self):
+        ids, final, _ = load_descriptor(
+            "artifacts/lvpcm/descriptors/stickerchat/final_clip_clean.pt"
+        )
+        names, packs = _pack_members(
+            "stickerchat/processed/sticker_metadata.json", ids
+        )
+        centroids = _pack_centroids(ids, final, names, packs)
+        assignments, _ = legacy_pack_kmeans(centroids, 384, 40, 20260330)
+        rebuilt = _sticker_assignments(ids, names, packs, assignments.tolist())
+        expected = _reference_k384_membership(
+            "stickerchat/processed_style_kmeans_k384/sticker_metadata.json", ids
+        )
+        self.assertEqual(rebuilt, expected)
+        compact = GroupBank.load(
+            "artifacts/style_shapes/groups/stickerchat/"
+            "final_clip_pack_original/group_bank.json"
+        )
+        self.assertEqual(compact.sticker_to_group, expected)
+
+    def test_fixed_candidate_hashes(self):
+        expected = {
+            "data/validation_pair_with_cand.json": (
+                10,
+                "1ab0c917c049e90a18d73836355edc927a1549e2b2bc26d0db3f9221ba138d32",
+            ),
+            "stickerchat/processed/release_val_u_sticker_format_int_with_cand_r10.json": (
+                10,
+                "c97655f9fb89097116c37a2fcae407b0a9208c0ec735e6883e2e4c6c1c422960",
+            ),
+            "stickerchat/processed/release_val_u_sticker_format_int_with_cand_r20.json": (
+                20,
+                "9abaf87a37a2e2e553c7b5d0ecb8fcd59601ec23bac790aa858737031c308f5e",
+            ),
+            "stickerchat/processed/release_test_u_sticker_format_int_with_cand_r10.json": (
+                10,
+                "4e73451bc50e1e27ce903b20358eab0de64a70166cd152bb89af4ba342398395",
+            ),
+            "stickerchat/processed/release_test_u_sticker_format_int_with_cand_r20.json": (
+                20,
+                "11a1952f6db7bb58d0fb817585a9ef04c759e9c86d26244c8033fc58f7ad5356",
+            ),
+            "stickerchat/processed/release_val_u_sticker_format_int_with_cand_same_pack_r10.json": (
+                10,
+                "4f15007736239b1bc474b49668ef016fd26007f93357a06dc985ad5b7c79a4be",
+            ),
+            "stickerchat/processed/release_test_u_sticker_format_int_with_cand_same_pack_r10.json": (
+                10,
+                "1e1711244ccde8652144fea3a79b3c769cdbae0ef74b0dd255e332cf223b7fa5",
+            ),
+        }
+        for path, (size, digest) in expected.items():
+            self.assertEqual(sha256_file(path), digest)
+            self.assertEqual(candidate_file_audit(path, size)["candidate_count"], size)
+
+    def test_init_snapshot_strict_reload_contract(self):
+        paths = (
+            "artifacts/style_shapes/init/dstc_seed2021.ckpt",
+            "artifacts/style_shapes/init/stickerchat_seed2021.ckpt",
+        )
+        missing = [path for path in paths if not os.path.exists(path)]
+        if missing:
+            self.skipTest("GPU initialization execution approval blocked: %s" % missing)
+
+    def test_dual_local_negative_real_asset_coverage(self):
+        with open(
+            "stickerchat/processed/release_train_u_sticker_format_int.json",
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            train_rows = json.load(handle)
+        eligible_rows = []
+        for source in ("vpd_pack", "final_clip_pack_original"):
+            bank = GroupBank.load(
+                "artifacts/style_shapes/groups/stickerchat/%s/group_bank.json"
+                % source
+            )
+            sampler = StickerChatDualLocalNegativeSampler(
+                bank,
+                load_id_to_pack("stickerchat/processed/sticker_metadata.json"),
+                seed=2021,
+            )
+            manifest = build_eligibility_manifest(train_rows, sampler)
+            validate_eligibility_manifest(manifest)
+            self.assertEqual(manifest["total_rows"], 320168)
+            self.assertEqual(manifest["eligible_count"], 319876)
+            self.assertEqual(manifest["excluded_count"], 292)
+            self.assertEqual(
+                manifest["excluded_reason_counts"],
+                {"singleton_original_pack": 292},
+            )
+            eligible_rows.append(manifest["eligible_rows"])
+        self.assertEqual(eligible_rows[0], eligible_rows[1])
+
+    def test_fixed_same_pack_r10_real_asset_contract(self):
+        manifest_path = (
+            "artifacts/style_shapes/candidates/"
+            "stickerchat_fixed_same_pack_r10/manifest.json"
+        )
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        validate_fixed_manifest(manifest, verify_files=True)
+        for split, expected in EXPECTED_SPLIT_STATS.items():
+            observed = manifest["splits"][split]["stats"]
+            self.assertEqual(observed["rows"], expected["rows"])
+            self.assertEqual(observed["gray_rows"], expected["gray_rows"])
+            self.assertEqual(observed["gray_slots"], expected["gray_slots"])
+        runtime = load_fixed_same_pack_runtime(
+            {
+                "mode": "fixed_same_pack_listwise",
+                "manifest_path": manifest_path,
+            },
+            train_data_path=(
+                "stickerchat/processed/"
+                "release_train_u_sticker_format_int.json"
+            ),
+        )
+        self.assertEqual(tuple(runtime.candidate_ids.shape), (320168, 10))
+        self.assertTrue(torch.equal(runtime.gray_mask, runtime.candidate_ids.eq(-1)))
+        for path in (
+            "configs/style_shapes/stickerchat_vpd_pack_fixed_same_pack_r10.yaml",
+            "configs/style_shapes/stickerchat_semsp_fixed_same_pack_r10.yaml",
+        ):
+            with open(path, "r", encoding="utf-8") as handle:
+                self.assertIn(manifest_path, handle.read())
+
+
+if __name__ == "__main__":
+    unittest.main()

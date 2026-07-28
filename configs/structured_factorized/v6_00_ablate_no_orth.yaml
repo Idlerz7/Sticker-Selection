@@ -1,0 +1,9 @@
+extends: v6_00_minimal_core.yaml
+name: v6_00_ablate_no_orth
+description: >
+  Ablation: disable style/expression disentanglement orthogonality regularizer (orth loss) via lambda_orth=0.
+  Keeps style_proto and expr rank losses at v6 minimal-core strengths.
+pl_root_dir: logs/structured_factorized_v6_00_ablate_no_orth
+
+lambda_orth: 0.0
+# lambda_style_proto / lambda_expr inherited from v6_00_minimal_core (0.4 / 0.3)

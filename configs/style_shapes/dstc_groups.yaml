@@ -1,0 +1,15 @@
+dataset: dstc
+num_groups: 85
+expected_stickers: 307
+seed: 2021
+random_seed: 2021
+n_init: 10
+max_iter: 100
+tol: 0.000001
+neighbor_topk: 5
+vpd_bundle: artifacts/lvpcm/descriptors/dstc/multi_clean.pt
+final_clip_bundle: artifacts/lvpcm/descriptors/dstc/final_clip_clean.pt
+legacy_bank: factorized_style_bank.json
+fixed_candidates: data/validation_pair_with_cand.json
+output_dir: artifacts/style_shapes/groups/dstc
+
